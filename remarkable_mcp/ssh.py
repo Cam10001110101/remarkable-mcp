@@ -528,10 +528,31 @@ class SSHClient:
         self._write_remote_json(f"{XOCHITL_PATH}/{doc_id}.metadata", metadata)
 
     def _restart_xochitl(self) -> None:
-        """Restart xochitl so it picks up filesystem-level metadata changes."""
+        """Restart xochitl so it picks up filesystem-level metadata changes.
+
+        A run of write ops issues several restarts in quick succession; once
+        systemd's start-limit (StartLimitBurst) trips, the unit enters a *failed*
+        state and stays down — freezing the tablet UI — until `reset-failed`. So
+        if the restart fails with a start-limit error, clear the failed state and
+        start once more rather than leaving xochitl dead.
+        """
         # xochitl is a systemd service; restart is brief (a few seconds of black
         # screen) but unavoidable — xochitl caches metadata in memory.
-        self._ssh_command("systemctl restart xochitl", timeout=30)
+        start_limit_markers = (
+            "attempted too often",
+            "start request repeated too quickly",
+        )
+        try:
+            self._ssh_command("systemctl restart xochitl", timeout=30)
+        except RuntimeError as e:
+            if not any(marker in str(e) for marker in start_limit_markers):
+                raise
+            # Start-limit tripped: clear the failed state, then start once more.
+            self._ssh_command(
+                "systemctl reset-failed xochitl.service && "
+                "systemctl start xochitl.service",
+                timeout=30,
+            )
 
     def delete(self, doc_id: str) -> Dict[str, Any]:
         """
