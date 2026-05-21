@@ -25,6 +25,7 @@ from mcp.types import (
     ToolAnnotations,
 )
 
+from remarkable_mcp import ocr
 from remarkable_mcp.api import (
     REMARKABLE_TOKEN,
     download_raw_file,
@@ -48,8 +49,6 @@ from remarkable_mcp.extract import (
     render_page_from_document_zip_svg,
 )
 from remarkable_mcp.responses import make_error, make_response
-from remarkable_mcp.ocr import get_ocr_backend, should_use_sampling_ocr
-from remarkable_mcp.sampling import ocr_via_sampling
 from remarkable_mcp.server import mcp
 
 
@@ -205,92 +204,6 @@ def _is_cloud_archived(item) -> bool:
     return parent == "trash"
 
 
-def _ocr_png_tesseract(png_path: Path) -> Optional[str]:
-    """
-    OCR a PNG file using Tesseract.
-
-    Args:
-        png_path: Path to the PNG file
-
-    Returns:
-        Extracted text, or None if OCR failed
-    """
-    try:
-        import pytesseract
-        from PIL import Image as PILImage
-        from PIL import ImageFilter, ImageOps
-
-        img = PILImage.open(png_path)
-
-        # Convert to grayscale
-        img = img.convert("L")
-
-        # Increase contrast
-        img = ImageOps.autocontrast(img, cutoff=2)
-
-        # Slight sharpening
-        img = img.filter(ImageFilter.SHARPEN)
-
-        # Run OCR with settings optimized for sparse handwriting
-        custom_config = r"--psm 11 --oem 3"
-        text = pytesseract.image_to_string(img, config=custom_config)
-
-        return text.strip() if text.strip() else None
-
-    except ImportError:
-        return None
-    except Exception:
-        return None
-
-
-def _ocr_png_google_vision(png_path: Path) -> Optional[str]:
-    """
-    OCR a PNG file using Google Cloud Vision API.
-
-    Args:
-        png_path: Path to the PNG file
-
-    Returns:
-        Extracted text, or None if OCR failed
-    """
-    import base64
-
-    import requests
-
-    api_key = os.environ.get("GOOGLE_VISION_API_KEY")
-    if not api_key:
-        return None
-
-    try:
-        with open(png_path, "rb") as f:
-            image_content = base64.b64encode(f.read()).decode("utf-8")
-
-        url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
-        payload = {
-            "requests": [
-                {
-                    "image": {"content": image_content},
-                    "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
-                }
-            ]
-        }
-
-        response = requests.post(url, json=payload, timeout=60)
-        if response.status_code == 200:
-            data = response.json()
-            if "responses" in data and data["responses"]:
-                resp = data["responses"][0]
-                if "fullTextAnnotation" in resp:
-                    text = resp["fullTextAnnotation"]["text"]
-                    return text.strip() if text.strip() else None
-
-    except Exception:
-        # Silently fail - OCR is best-effort and caller will handle None
-        pass
-
-    return None
-
-
 @mcp.tool(annotations=READ_ANNOTATIONS)
 async def remarkable_read(
     document: str,
@@ -431,13 +344,15 @@ async def remarkable_read(
             # For notebooks (no PDF/EPUB), use page-based pagination
             is_notebook = file_type not in ("pdf", "epub")
 
-            # Determine if we should use sampling OCR
-            use_sampling = is_notebook and include_ocr and ctx and should_use_sampling_ocr(ctx)
+            # Determine the lazy, page-level OCR engine (sampling/ollama), if any.
+            page_engine = (
+                ocr.resolve_page_ocr_engine(ctx) if (is_notebook and include_ocr) else None
+            )
 
-            # For sampling OCR: use per-page caching and only OCR requested page
-            if use_sampling:
+            # Page-level OCR: per-page caching, only OCR the requested page.
+            if page_engine:
                 # Check per-page cache first
-                cached_text = get_cached_page_ocr(target_doc.ID, page, "sampling")
+                cached_text = get_cached_page_ocr(target_doc.ID, page, page_engine)
                 if cached_text is not None:
                     # We have cached OCR for this page
                     # Still need to get total page count
@@ -453,7 +368,7 @@ async def remarkable_read(
                     # Build notebook_pages list with just the cached page
                     notebook_pages = [""] * total_notebook_pages
                     notebook_pages[page - 1] = cached_text
-                    ocr_backend_used = "sampling"
+                    ocr_backend_used = page_engine
                 else:
                     # No cache - render and OCR just the requested page
                     raw_doc = client.download(target_doc)
@@ -476,20 +391,20 @@ async def remarkable_read(
                         # Render just the requested page
                         png_data = render_page_from_document_zip(tmp_path, page)
                         if png_data:
-                            # OCR the single page
-                            ocr_text = await ocr_via_sampling(ctx, png_data)
+                            # OCR the single page via the unified dispatcher
+                            ocr_text, used_backend = await ocr.ocr_png(png_data, ctx)
                             if ocr_text:
                                 # Cache the result
-                                cache_page_ocr(target_doc.ID, page, "sampling", ocr_text)
+                                cache_page_ocr(target_doc.ID, page, page_engine, ocr_text)
                                 # Build notebook_pages list
                                 notebook_pages = [""] * total_notebook_pages
                                 notebook_pages[page - 1] = ocr_text
-                                ocr_backend_used = "sampling"
+                                ocr_backend_used = used_backend or page_engine
                     finally:
                         tmp_path.unlink(missing_ok=True)
 
-            # For non-sampling: check full document cache or extract all
-            if not use_sampling and is_notebook and include_ocr:
+            # Non-page-level: check full document cache or batch extract
+            if not page_engine and is_notebook and include_ocr:
                 cached = get_cached_ocr_result(target_doc.ID, include_ocr=True, ocr_backend=None)
                 if cached and cached.get("handwritten_text"):
                     notebook_pages = cached["handwritten_text"]
@@ -1609,40 +1524,11 @@ async def remarkable_image(
                         ),
                     )
 
-                # Handle OCR if requested - extract text from the image
+                # OCR via the unified dispatcher (auto prefers local ollama).
                 ocr_text = None
                 ocr_backend_used = None
                 if include_ocr:
-                    # Try sampling-based OCR if configured and available
-                    # This sends the image to the client's LLM to extract text
-                    if ctx and should_use_sampling_ocr(ctx):
-                        ocr_text = await ocr_via_sampling(ctx, png_data)
-                        if ocr_text:
-                            ocr_backend_used = "sampling"
-
-                    # Fall back to traditional OCR if sampling failed or not available
-                    if ocr_text is None:
-                        # Need to temporarily save PNG to file for tesseract/google
-                        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as ocr_tmp:
-                            ocr_tmp.write(png_data)
-                            ocr_tmp_path = Path(ocr_tmp.name)
-                        try:
-                            backend = get_ocr_backend()
-                            # When backend is "sampling" but sampling failed, fall through to
-                            # Google (if API key available) or Tesseract as per documented behavior
-                            if backend in ("sampling", "google") or (
-                                backend == "auto" and os.environ.get("GOOGLE_VISION_API_KEY")
-                            ):
-                                ocr_text = _ocr_png_google_vision(ocr_tmp_path)
-                                if ocr_text:
-                                    ocr_backend_used = "google"
-                            # Fall through to Tesseract if Google not available or returned None
-                            if ocr_text is None:
-                                ocr_text = _ocr_png_tesseract(ocr_tmp_path)
-                                if ocr_text:
-                                    ocr_backend_used = "tesseract"
-                        finally:
-                            ocr_tmp_path.unlink(missing_ok=True)
+                    ocr_text, ocr_backend_used = await ocr.ocr_png(png_data, ctx)
 
                 resource_uri = f"remarkableimg:///{uri_path}.page-{page}.png"
                 png_base64 = base64.b64encode(png_data).decode("utf-8")
