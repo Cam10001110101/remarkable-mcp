@@ -220,6 +220,24 @@ from remarkable_mcp import (  # noqa: E402
 )
 
 
-def run():
-    """Run the MCP server."""
-    mcp.run()
+def run(http: bool = False, host: str = "127.0.0.1", port: int = 8000):
+    """Run the MCP server.
+
+    Args:
+        http: Serve over streamable-HTTP (network) instead of stdio. Use this to
+            run a standalone, always-on endpoint that clients reach by URL
+            (http://host:port/mcp) rather than spawning a local process.
+        host: HTTP bind host. Defaults to localhost; use "0.0.0.0" for LAN/mesh.
+        port: HTTP port.
+
+    Transport is orthogonal to the tablet connection mode (cloud / --usb / --ssh),
+    which is selected separately via environment variables.
+    """
+    if http:
+        # FastMCP reads host/port from its settings; the module-level `mcp` was
+        # built without them, so set them before serving.
+        mcp.settings.host = host
+        mcp.settings.port = port
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()

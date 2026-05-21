@@ -6,6 +6,8 @@ Tests the 4 intent-based tools using FastMCP's testing capabilities.
 """
 
 import json
+import os
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -129,6 +131,85 @@ class TestMCPServerInitialization:
             # Check for XML tags in description
             desc = tool.description
             assert "<usecase>" in desc, f"Tool {tool.name} missing <usecase> tag"
+
+
+# =============================================================================
+# Test Transport Selection (stdio vs streamable-http)
+# =============================================================================
+
+
+class TestTransportSelection:
+    """Test that run() and the CLI select stdio vs HTTP transport correctly."""
+
+    def test_run_defaults_to_stdio(self):
+        """run() with no args runs stdio (mcp.run() with no transport)."""
+        with patch("remarkable_mcp.server.mcp") as mock_mcp:
+            from remarkable_mcp.server import run
+
+            run()
+
+            mock_mcp.run.assert_called_once_with()
+
+    def test_run_http_sets_settings_and_transport(self):
+        """run(http=True, ...) sets host/port and runs streamable-http."""
+        with patch("remarkable_mcp.server.mcp") as mock_mcp:
+            from remarkable_mcp.server import run
+
+            run(http=True, host="0.0.0.0", port=9000)
+
+            assert mock_mcp.settings.host == "0.0.0.0"
+            assert mock_mcp.settings.port == 9000
+            mock_mcp.run.assert_called_once_with(transport="streamable-http")
+
+    def test_cli_default_runs_stdio(self, monkeypatch):
+        """`remarkable-mcp` with no flags calls run() with http=False defaults."""
+        import remarkable_mcp.cli as cli
+
+        monkeypatch.setattr(sys, "argv", ["remarkable-mcp"])
+        mock_run = Mock()
+        monkeypatch.setattr("remarkable_mcp.server.run", mock_run)
+
+        cli.main()
+
+        mock_run.assert_called_once_with(http=False, host="127.0.0.1", port=8000)
+
+    def test_cli_ssh_http_passthrough(self, monkeypatch):
+        """`--ssh --http --host --port` sets SSH mode and passes HTTP args through."""
+        import remarkable_mcp.cli as cli
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["remarkable-mcp", "--ssh", "--http", "--host", "0.0.0.0", "--port", "9000"],
+        )
+        mock_run = Mock()
+        monkeypatch.setattr("remarkable_mcp.server.run", mock_run)
+
+        prev = os.environ.get("REMARKABLE_USE_SSH")
+        try:
+            cli.main()
+
+            mock_run.assert_called_once_with(http=True, host="0.0.0.0", port=9000)
+            assert os.environ["REMARKABLE_USE_SSH"] == "1"
+        finally:
+            if prev is None:
+                os.environ.pop("REMARKABLE_USE_SSH", None)
+            else:
+                os.environ["REMARKABLE_USE_SSH"] = prev
+
+    def test_cli_host_port_default_from_env(self, monkeypatch):
+        """--host/--port default from REMARKABLE_HTTP_HOST/PORT env vars."""
+        import remarkable_mcp.cli as cli
+
+        monkeypatch.setattr(sys, "argv", ["remarkable-mcp", "--http"])
+        monkeypatch.setenv("REMARKABLE_HTTP_HOST", "0.0.0.0")
+        monkeypatch.setenv("REMARKABLE_HTTP_PORT", "7777")
+        mock_run = Mock()
+        monkeypatch.setattr("remarkable_mcp.server.run", mock_run)
+
+        cli.main()
+
+        mock_run.assert_called_once_with(http=True, host="0.0.0.0", port=7777)
 
 
 # =============================================================================
