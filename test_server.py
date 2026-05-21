@@ -2312,6 +2312,35 @@ class TestSSHWriteOperations:
             with pytest.raises(RuntimeError, match="Operation timed out"):
                 client._restart_xochitl()
 
+    def test_create_rm_notebook_writes_native_strokes_and_restarts(self):
+        """Native .rm notebook: writes a {page}.rm + notebook .content (cPages) +
+        DocumentType .metadata, and restarts xochitl."""
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient()
+        with patch.object(client, "_ssh_command", return_value="") as mock_cmd, patch.object(
+            client, "_ssh_pipe"
+        ) as mock_pipe:
+            result = client.create_rm_notebook("Reply", [b"RMV6DATA"], parent_id="folder-uuid")
+
+        assert result["pages"] == 1
+        assert result["parent"] == "folder-uuid"
+        assert result["transport"] == "ssh"
+        cmds = [c.args[0] for c in mock_cmd.call_args_list]
+        assert any("mkdir -p" in c and result["id"] in c for c in cmds)
+        assert any("systemctl restart xochitl" in c for c in cmds)
+        # the page stroke file is streamed (binary, non-JSON) to a *.rm path
+        pipe_cmds = [c.args[1] for c in mock_pipe.call_args_list]
+        assert any(".rm" in c for c in pipe_cmds)
+        # .content is a v6 notebook with a cPages page id; .metadata is DocumentType
+        writes = self._json_writes(mock_pipe)
+        content = [w for w in writes if w.get("fileType") == "notebook"]
+        assert content and content[0]["cPages"]["pages"][0]["id"]
+        assert content[0]["pageCount"] == 1
+        meta = [w for w in writes if w.get("type") == "DocumentType"]
+        assert meta and meta[0]["visibleName"] == "Reply"
+        assert meta[0]["parent"] == "folder-uuid"
+
     def test_create_notebook_generates_pdf_and_uploads_via_ssh(self):
         from remarkable_mcp.ssh import SSHClient
 

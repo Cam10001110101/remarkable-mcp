@@ -728,6 +728,103 @@ class SSHClient:
             "transport": "ssh",
         }
 
+    def create_rm_notebook(
+        self,
+        name: str,
+        rm_pages: List[bytes],
+        parent_id: str = "",
+        template: str = "Blank",
+    ) -> Dict[str, Any]:
+        """Create a NATIVE .rm v6 notebook on the tablet via SSH (EXPERIMENTAL).
+
+        Unlike `create_notebook` (which uploads a blank PDF), this writes real
+        reMarkable stroke pages: one `{page_uuid}.rm` per entry in `rm_pages`,
+        inside a `{doc_uuid}/` folder, plus a v6 notebook `.content` (with
+        `cPages`) and a DocumentType `.metadata`. The strokes are native
+        (selectable/erasable, real pen tool). The `.content` schema mirrors a
+        real single-page notebook captured from a device. Restarts xochitl.
+        """
+        import uuid as _uuid
+
+        if not rm_pages:
+            raise RuntimeError("create_rm_notebook requires at least one .rm page")
+
+        doc_id = str(_uuid.uuid4())
+        now_ms = str(int(time.time() * 1000))
+
+        # Page folder + one {page}.rm per page (binary, piped over stdin).
+        self._ssh_command(f"mkdir -p {shlex.quote(f'{XOCHITL_PATH}/{doc_id}')}")
+        page_entries = []
+        for rm_bytes in rm_pages:
+            page_id = str(_uuid.uuid4())
+            self._scp_upload(rm_bytes, f"{XOCHITL_PATH}/{doc_id}/{page_id}.rm")
+            page_entries.append(
+                {
+                    "id": page_id,
+                    "idx": {"timestamp": "1:2", "value": "ba"},
+                    "template": {"timestamp": "1:1", "value": template},
+                }
+            )
+
+        content = {
+            "cPages": {
+                "lastOpened": {"timestamp": "0:0", "value": ""},
+                "original": {"timestamp": "0:0", "value": -1},
+                "pages": page_entries,
+                "uuids": [{"first": str(_uuid.uuid4()), "second": 1}],
+            },
+            "coverPageNumber": 0,
+            "customZoomCenterX": 0,
+            "customZoomCenterY": 0,
+            "customZoomOrientation": "portrait",
+            "customZoomPageHeight": 1872,
+            "customZoomPageWidth": 1404,
+            "customZoomScale": 1,
+            "documentMetadata": {},
+            "extraMetadata": {},
+            "fileType": "notebook",
+            "fontName": "",
+            "formatVersion": 2,
+            "lineHeight": -1,
+            "orientation": "portrait",
+            "pageCount": len(rm_pages),
+            "pageTags": [],
+            "tags": [],
+            "textAlignment": "justify",
+            "textScale": 1,
+            "zoomMode": "bestFit",
+        }
+        self._write_remote_json(f"{XOCHITL_PATH}/{doc_id}.content", content)
+
+        metadata = {
+            "createdTime": now_ms,
+            "lastModified": now_ms,
+            "lastOpened": now_ms,
+            "lastOpenedPage": 0,
+            "metadatamodified": False,
+            "modified": False,
+            "new": True,
+            "parent": parent_id,
+            "pinned": False,
+            # On-device item: must NOT be synced=False (see is_cloud_archived).
+            "synced": True,
+            "type": "DocumentType",
+            "version": 0,
+            "visibleName": name,
+        }
+        self._write_metadata(doc_id, metadata)
+
+        self._restart_xochitl()
+        self._documents = []
+        self._documents_by_id = {}
+        return {
+            "id": doc_id,
+            "name": name,
+            "pages": len(rm_pages),
+            "parent": parent_id,
+            "transport": "ssh",
+        }
+
     def get_all_file_types(self) -> dict[str, Optional[str]]:
         """
         Get file types for all documents in a single SSH command.
