@@ -1498,6 +1498,21 @@ class TestOcrConfig:
         assert ocr._normalize_host("http://h:1/") == "http://h:1"
         assert ocr._normalize_host("https://x") == "https://x"
 
+    def test_ollama_temperature_default_and_env(self):
+        import os
+
+        from remarkable_mcp import ocr
+
+        os.environ.pop("REMARKABLE_OLLAMA_TEMPERATURE", None)
+        try:
+            assert ocr.get_ollama_temperature() == 0.0
+            os.environ["REMARKABLE_OLLAMA_TEMPERATURE"] = "1"
+            assert ocr.get_ollama_temperature() == 1.0
+            os.environ["REMARKABLE_OLLAMA_TEMPERATURE"] = "bad"
+            assert ocr.get_ollama_temperature() == 0.0  # invalid -> default
+        finally:
+            os.environ.pop("REMARKABLE_OLLAMA_TEMPERATURE", None)
+
 
 class TestOllamaEngine:
     """The local Ollama OCR engine."""
@@ -1516,6 +1531,7 @@ class TestOllamaEngine:
         assert body["model"] == "gemma4:31b"
         assert body["images"] and isinstance(body["images"][0], str)
         assert body["stream"] is False
+        assert body["options"]["temperature"] == 0.0  # OCR default
 
     def test_ocr_png_ollama_no_text_sentinel(self):
         from unittest.mock import MagicMock, patch
