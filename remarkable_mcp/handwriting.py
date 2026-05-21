@@ -46,25 +46,25 @@ Stroke = List[Tuple[float, float]]  # a polyline in device coordinates
 # real on-device strokes (width ~8-11, pressure ~150-200). Refine after a device
 # survey. `color` is a `PenColor`; highlighter uses the translucent HIGHLIGHT color.
 PEN_PRESETS = {
-    "fineliner": dict(tool=si.Pen.FINELINER_2, color=si.PenColor.BLACK,
-                      base_width=11, base_pressure=190, thickness_scale=1.0),
     "ballpoint": dict(tool=si.Pen.BALLPOINT_2, color=si.PenColor.BLACK,
-                      base_width=9, base_pressure=185, thickness_scale=1.0),
+                      base_width=16, base_pressure=220, thickness_scale=2.0),
+    "fineliner": dict(tool=si.Pen.FINELINER_2, color=si.PenColor.BLACK,
+                      base_width=13, base_pressure=210, thickness_scale=2.0),
     "marker": dict(tool=si.Pen.MARKER_2, color=si.PenColor.BLACK,
-                   base_width=16, base_pressure=180, thickness_scale=1.5),
+                   base_width=24, base_pressure=220, thickness_scale=2.5),
     "pencil": dict(tool=si.Pen.PENCIL_2, color=si.PenColor.BLACK,
-                   base_width=10, base_pressure=150, thickness_scale=1.0),
+                   base_width=14, base_pressure=190, thickness_scale=2.0),
     "mechanical_pencil": dict(tool=si.Pen.MECHANICAL_PENCIL_2, color=si.PenColor.BLACK,
-                              base_width=7, base_pressure=160, thickness_scale=1.0),
+                              base_width=10, base_pressure=200, thickness_scale=1.5),
     "paintbrush": dict(tool=si.Pen.PAINTBRUSH_2, color=si.PenColor.BLACK,
-                       base_width=12, base_pressure=170, thickness_scale=1.5),
+                       base_width=32, base_pressure=230, thickness_scale=1.0),
     "calligraphy": dict(tool=si.Pen.CALIGRAPHY, color=si.PenColor.BLACK,
-                        base_width=12, base_pressure=180, thickness_scale=1.5),
-    # Highlighter is for emphasis, not writing prose; even tuned down it's chunky.
+                        base_width=18, base_pressure=220, thickness_scale=2.0),
+    # Highlighter is for emphasis, not writing prose; wide + translucent.
     "highlighter": dict(tool=si.Pen.HIGHLIGHTER_2, color=si.PenColor.HIGHLIGHT,
-                        base_width=16, base_pressure=180, thickness_scale=2.0),
+                        base_width=30, base_pressure=200, thickness_scale=3.0),
 }
-DEFAULT_PEN = "fineliner"
+DEFAULT_PEN = "ballpoint"
 
 
 def _hershey_line_segments(line_text: str, font: str):
@@ -153,11 +153,11 @@ def text_to_strokes(
 def strokes_to_lines(
     strokes: List[Stroke],
     *,
-    tool: si.Pen = si.Pen.FINELINER_2,
+    tool: si.Pen = si.Pen.BALLPOINT_2,
     color: si.PenColor = si.PenColor.BLACK,
-    base_width: int = 11,
-    base_pressure: int = 190,
-    thickness_scale: float = 1.0,
+    base_width: int = 16,
+    base_pressure: int = 220,
+    thickness_scale: float = 2.0,
     seed: int = 1,
 ) -> List[si.Line]:
     """Convert polylines to rmscene Line strokes, calibrated against real device
