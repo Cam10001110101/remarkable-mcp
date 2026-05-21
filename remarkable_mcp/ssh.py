@@ -478,7 +478,9 @@ class SSHClient:
             "new": True,
             "parent": parent_id,
             "pinned": False,
-            "synced": False,
+            # On-device item: must NOT be synced=False, or is_cloud_archived
+            # treats it as "not on device" and browse/read/recent hide it.
+            "synced": True,
             "type": "CollectionType",
             "version": 0,
             "visibleName": name,
@@ -651,7 +653,9 @@ class SSHClient:
             "new": True,
             "parent": parent_id,
             "pinned": False,
-            "synced": False,
+            # On-device item: must NOT be synced=False, or is_cloud_archived
+            # treats it as "not on device" and browse/read/recent hide it.
+            "synced": True,
             "type": "DocumentType",
             "version": 0,
             "visibleName": visible_name,

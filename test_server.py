@@ -1943,3 +1943,34 @@ class TestSSHMetadataFraming:
         assert names == ["Alpha", "Beta"], (
             f"both folders should parse despite the missing newline; got {names}"
         )
+
+    def test_created_folder_is_not_cloud_archived(self):
+        """A freshly created local folder must not read as cloud-archived.
+
+        Document.is_cloud_archived is `not synced or parent == 'trash'`, and
+        browse/read/recent skip cloud-archived items. Writing synced=False on a
+        brand-new on-device folder therefore makes it invisible to those tools
+        (delete/move look up by name and were unaffected, masking the bug).
+        """
+        from remarkable_mcp.ssh import Document, SSHClient
+
+        client = SSHClient(password="x")
+        captured = {}
+        with patch.object(
+            client, "_write_metadata", side_effect=lambda doc_id, md: captured.setdefault("md", md)
+        ), patch.object(client, "_restart_xochitl"):
+            client.create_folder("Test Folder")
+
+        md = captured["md"]
+        doc = Document(
+            id="x",
+            hash="x",
+            name=md["visibleName"],
+            doc_type=md["type"],
+            parent=md.get("parent", ""),
+            synced=md.get("synced", True),  # same default get_meta_items uses
+        )
+        assert not doc.is_cloud_archived, (
+            "create_folder produced a cloud-archived folder; browse/read/recent "
+            "will hide it. Newly created on-device items must not be synced=False."
+        )
