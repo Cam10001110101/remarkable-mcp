@@ -1662,94 +1662,96 @@ class TestUSBWebWriteOperations:
 
 
 class TestSSHWriteOperations:
-    """Test the SSHClient write methods (delete + move) with mocked SSH."""
+    """Test the SSHClient write methods with mocked SSH. All writes stream over
+    _ssh_pipe (cat > tmp && mv) rather than base64 — the tablet has no base64
+    binary, a bug the real-device smoke test caught."""
+
+    @staticmethod
+    def _json_writes(mock_pipe):
+        """Decode JSON payloads streamed via _ssh_pipe, asserting none of the
+        write commands depend on a `base64` binary (regression guard for the
+        'base64: command not found' device failure)."""
+        writes = []
+        for call in mock_pipe.call_args_list:
+            data, command = call.args[0], call.args[1]
+            assert "base64" not in command, f"write must not use base64: {command}"
+            try:
+                writes.append(json.loads(data.decode("utf-8")))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                pass  # non-JSON payload (e.g. a raw PDF) — skip
+        return writes
 
     def test_delete_marks_metadata_and_restarts_xochitl(self):
         from remarkable_mcp.ssh import SSHClient
 
         client = SSHClient()
-        # First call: cat metadata (read). Second: write back. Third: restart.
-        with patch.object(client, "_ssh_command") as mock_cmd:
-            mock_cmd.side_effect = [
+        # _ssh_command: cat metadata (read), then restart. The write goes via pipe.
+        with patch.object(
+            client,
+            "_ssh_command",
+            side_effect=[
                 json.dumps({"deleted": False, "type": "DocumentType", "parent": ""}),
-                "",  # write
-                "",  # restart
-            ]
+                "",
+            ],
+        ) as mock_cmd, patch.object(client, "_ssh_pipe") as mock_pipe:
             result = client.delete("doc-uuid-1")
 
         assert result["deleted"] is True
         assert result["transport"] == "ssh"
-        # The write call should include base64-encoded metadata with deleted:true
-        write_cmd = mock_cmd.call_args_list[1].args[0]
-        # base64 segment in the cmd should decode to JSON with deleted:true
-        import base64 as _b64
-        import re
-
-        # shlex.quote may or may not wrap the base64 in quotes depending on chars.
-        match = re.search(r"echo '?([A-Za-z0-9+/=]+)'? \| base64 -d", write_cmd)
-        assert match, f"Could not find base64 payload in: {write_cmd[:200]}"
-        encoded = match.group(1)
-        decoded = json.loads(_b64.b64decode(encoded).decode())
-        assert decoded["deleted"] is True
-        assert decoded["metadatamodified"] is True
-
-        # Third call should be the systemctl restart
-        assert "systemctl restart xochitl" in mock_cmd.call_args_list[2].args[0]
+        writes = self._json_writes(mock_pipe)
+        assert writes and writes[0]["deleted"] is True
+        assert writes[0]["metadatamodified"] is True
+        assert any(
+            "systemctl restart xochitl" in c.args[0] for c in mock_cmd.call_args_list
+        )
 
     def test_create_folder_writes_collectiontype_metadata(self):
         from remarkable_mcp.ssh import SSHClient
 
         client = SSHClient()
-        with patch.object(client, "_ssh_command") as mock_cmd:
-            mock_cmd.side_effect = ["", ""]  # write + restart
+        with (
+            patch.object(client, "_ssh_command", return_value="") as mock_cmd,
+            patch.object(client, "_ssh_pipe") as mock_pipe,
+        ):
             result = client.create_folder("Reading", parent_id="parent-uuid")
 
         assert result["name"] == "Reading"
         assert result["parent"] == "parent-uuid"
         assert result["transport"] == "ssh"
-
-        write_cmd = mock_cmd.call_args_list[0].args[0]
-        import base64 as _b64
-        import re
-
-        match = re.search(r"echo '?([A-Za-z0-9+/=]+)'? \| base64 -d", write_cmd)
-        assert match
-        decoded = json.loads(_b64.b64decode(match.group(1)).decode())
-        assert decoded["type"] == "CollectionType"
-        assert decoded["visibleName"] == "Reading"
-        assert decoded["parent"] == "parent-uuid"
+        writes = self._json_writes(mock_pipe)
+        assert writes and writes[0]["type"] == "CollectionType"
+        assert writes[0]["visibleName"] == "Reading"
+        assert writes[0]["parent"] == "parent-uuid"
+        assert any(
+            "systemctl restart xochitl" in c.args[0] for c in mock_cmd.call_args_list
+        )
 
     def test_move_updates_parent_and_restarts_xochitl(self):
         from remarkable_mcp.ssh import SSHClient
 
         client = SSHClient()
-        with patch.object(client, "_ssh_command") as mock_cmd:
-            mock_cmd.side_effect = [
+        with patch.object(
+            client,
+            "_ssh_command",
+            side_effect=[
                 json.dumps({"deleted": False, "type": "DocumentType", "parent": "old"}),
                 "",
-                "",
-            ]
+            ],
+        ), patch.object(client, "_ssh_pipe") as mock_pipe:
             result = client.move("doc-uuid-2", "new-parent-uuid")
 
         assert result["parent"] == "new-parent-uuid"
-        write_cmd = mock_cmd.call_args_list[1].args[0]
-        import base64 as _b64
-        import re
-
-        # shlex.quote may or may not wrap the base64 in quotes depending on chars.
-        match = re.search(r"echo '?([A-Za-z0-9+/=]+)'? \| base64 -d", write_cmd)
-        assert match, f"Could not find base64 payload in: {write_cmd[:200]}"
-        encoded = match.group(1)
-        decoded = json.loads(_b64.b64decode(encoded).decode())
-        assert decoded["parent"] == "new-parent-uuid"
+        writes = self._json_writes(mock_pipe)
+        assert writes and writes[0]["parent"] == "new-parent-uuid"
 
     def test_upload_writes_payload_metadata_content_and_restarts(self):
         from remarkable_mcp.ssh import SSHClient
 
         client = SSHClient()
-        with patch.object(client, "_scp_upload") as mock_scp, patch.object(
-            client, "_ssh_command", return_value=""
-        ) as mock_cmd:
+        with (
+            patch.object(client, "_ssh_command", return_value="") as mock_cmd,
+            patch.object(client, "_ssh_pipe") as mock_pipe,
+        ):
             result = client.upload(
                 b"%PDF-1.4 data", filename="paper.pdf", parent_id="folder-uuid"
             )
@@ -1759,34 +1761,33 @@ class TestSSHWriteOperations:
         assert result["name"] == "paper"
         assert result["transport"] == "ssh"
 
-        # The binary payload was streamed to {uuid}.pdf via _scp_upload.
-        assert mock_scp.call_args.args[0] == b"%PDF-1.4 data"
-        assert mock_scp.call_args.args[1].endswith(f"{result['id']}.pdf")
+        # First pipe call streams the PDF payload straight to {uuid}.pdf.
+        first_data, first_cmd = (
+            mock_pipe.call_args_list[0].args[0],
+            mock_pipe.call_args_list[0].args[1],
+        )
+        assert first_data == b"%PDF-1.4 data"
+        assert first_cmd.startswith("cat > ")
+        assert f"{result['id']}.pdf" in first_cmd
 
-        # Decode every base64 JSON blob written over SSH: one .content (fileType
-        # pdf) and one .metadata (DocumentType under our parent). Plus a restart.
-        import base64 as _b64
-        import re
-
-        cmds = [c.args[0] for c in mock_cmd.call_args_list]
-        assert any("systemctl restart xochitl" in c for c in cmds)
-        blobs = []
-        for c in cmds:
-            m = re.search(r"echo '?([A-Za-z0-9+/=]+)'? \| base64 -d", c)
-            if m:
-                blobs.append(json.loads(_b64.b64decode(m.group(1)).decode()))
-        assert any(b.get("fileType") == "pdf" for b in blobs)
-        meta = [b for b in blobs if b.get("type") == "DocumentType"]
+        # .content (fileType pdf) and .metadata (DocumentType) stream as JSON —
+        # _json_writes also asserts no command uses base64.
+        writes = self._json_writes(mock_pipe)
+        assert any(w.get("fileType") == "pdf" for w in writes)
+        meta = [w for w in writes if w.get("type") == "DocumentType"]
         assert meta and meta[0]["parent"] == "folder-uuid"
         assert meta[0]["visibleName"] == "paper"
+        assert any(
+            "systemctl restart xochitl" in c.args[0] for c in mock_cmd.call_args_list
+        )
 
     def test_create_notebook_generates_pdf_and_uploads_via_ssh(self):
         from remarkable_mcp.ssh import SSHClient
 
         client = SSHClient()
-        with patch.object(client, "_scp_upload") as mock_scp, patch.object(
-            client, "_ssh_command", return_value=""
-        ):
+        with patch.object(client, "_ssh_command", return_value=""), patch.object(
+            client, "_ssh_pipe"
+        ) as mock_pipe:
             result = client.create_notebook("Notes", pages=2, parent_id="p1")
 
         assert result["name"] == "Notes"
@@ -1794,7 +1795,8 @@ class TestSSHWriteOperations:
         assert result["parent"] == "p1"
         assert result["transport"] == "ssh"
 
-        uploaded = mock_scp.call_args.args[0]
+        # First pipe call is the PDF payload.
+        uploaded = mock_pipe.call_args_list[0].args[0]
         assert uploaded.startswith(b"%PDF")
         import fitz
 
@@ -1888,3 +1890,56 @@ class TestWriteToolGuards:
                 import remarkable_mcp.api
 
                 importlib.reload(remarkable_mcp.api)
+
+
+# =============================================================================
+# Test SSH metadata framing (regression: trailing newline / listing parser)
+# =============================================================================
+
+
+class TestSSHMetadataFraming:
+    """Regression tests for the SSH write/read framing bug.
+
+    Metadata written by the SSH tools had no trailing newline, so the listing
+    command's `cat "$f"` ran the next `===FILE===` marker onto the previous
+    file's closing brace (`}===FILE===nextid`). The line-start parser then
+    treated the merged marker as content, so json.loads hit "Extra data" and
+    the item (and the next one in glob order) silently vanished from listings.
+    """
+
+    def test_write_remote_json_payload_ends_with_newline(self):
+        """Writer must terminate metadata with a newline so files stay separable."""
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient(password="x")
+        captured = {}
+
+        def fake_pipe(data, remote_command, timeout=120):
+            captured["data"] = data
+
+        with patch.object(client, "_ssh_pipe", side_effect=fake_pipe):
+            client._write_remote_json("/x/y.metadata", {"a": 1})
+
+        assert captured["data"].endswith(b"\n"), (
+            "metadata payload must end with a newline so the listing parser can "
+            "separate adjacent files"
+        )
+
+    def test_get_meta_items_parses_file_without_trailing_newline(self):
+        """Listing must recover a file whose content abuts the next marker."""
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient(password="x")
+        md1 = json.dumps({"visibleName": "Alpha", "type": "CollectionType", "parent": ""})
+        md2 = json.dumps({"visibleName": "Beta", "type": "CollectionType", "parent": ""})
+        # md1 has NO trailing newline, so its closing brace abuts the next
+        # marker -- exactly the corruption observed on-device.
+        merged = f"===FILE===id-alpha\n{md1}===FILE===id-beta\n{md2}\n"
+
+        with patch.object(client, "_ssh_command", return_value=merged):
+            docs = client.get_meta_items()
+
+        names = sorted(d.name for d in docs)
+        assert names == ["Alpha", "Beta"], (
+            f"both folders should parse despite the missing newline; got {names}"
+        )

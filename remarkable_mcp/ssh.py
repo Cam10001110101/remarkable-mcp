@@ -191,11 +191,13 @@ class SSHClient:
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"SSH cat timed out after {timeout}s")
 
-    def _scp_upload(self, data: bytes, remote_path: str, timeout: int = 120) -> None:
-        """Upload raw bytes to a remote path via SSH (`cat > file` over stdin).
+    def _ssh_pipe(self, data: bytes, remote_command: str, timeout: int = 120) -> None:
+        """Run a remote command with `data` piped to its stdin.
 
-        Mirrors _scp_download. Piping through stdin avoids ARG_MAX limits and
-        base64 overhead, so it handles real PDFs/EPUBs, not just tiny metadata.
+        This is how all writes reach the tablet. Streaming over stdin (vs.
+        embedding the payload in the command string) avoids ARG_MAX limits and,
+        critically, any dependency on a `base64` binary — the reMarkable's
+        minimal userland ships `cat`/`mv` but NOT `base64`.
         """
         ssh_args = [
             "ssh",
@@ -206,7 +208,7 @@ class SSHClient:
             "-p",
             str(self.port),
             f"{self.user}@{self.host}",
-            f"cat > {shlex.quote(remote_path)}",
+            remote_command,
         ]
 
         # If no password, use BatchMode for key-based auth
@@ -225,9 +227,13 @@ class SSHClient:
                 timeout=timeout,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"SSH upload failed: {result.stderr.decode()}")
+                raise RuntimeError(f"SSH pipe failed: {result.stderr.decode()}")
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"SSH upload timed out after {timeout}s")
+            raise RuntimeError(f"SSH pipe timed out after {timeout}s")
+
+    def _scp_upload(self, data: bytes, remote_path: str, timeout: int = 120) -> None:
+        """Upload raw bytes to a remote path via SSH (`cat > file` over stdin)."""
+        self._ssh_pipe(data, f"cat > {shlex.quote(remote_path)}", timeout=timeout)
 
     def check_connection(self) -> bool:
         """Check if SSH connection to tablet is available."""
@@ -271,31 +277,27 @@ class SSHClient:
 
         documents = []
 
-        # Parse the output - split by our delimiter
-        current_id = None
-        current_content = []
-
-        for line in output.split("\n"):
-            if line.startswith("===FILE==="):
-                # Save previous document if we have one
-                if current_id and current_content:
-                    self._parse_and_add_document(
-                        current_id, "\n".join(current_content), documents, limit
-                    )
-                    if limit is not None and len(documents) >= limit:
-                        break
-                # Start new document
-                current_id = line.replace("===FILE===", "").strip()
-                current_content = []
-            else:
-                current_content.append(line)
-
-        # Don't forget the last document
-        if current_id and current_content:
-            if limit is None or len(documents) < limit:
-                self._parse_and_add_document(
-                    current_id, "\n".join(current_content), documents, limit
-                )
+        # Parse the output by splitting on the marker STRING rather than
+        # requiring it at the start of a line. A metadata file written without
+        # a trailing newline makes its closing brace abut the next marker
+        # (`}===FILE===nextid`); a line-based parser would fold that marker into
+        # the previous file's content and drop both files. Splitting on the
+        # marker itself stays correct regardless of trailing newlines.
+        for chunk in output.split("===FILE==="):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            # First line of the chunk is the document id; the rest is its JSON.
+            newline = chunk.find("\n")
+            if newline == -1:
+                continue
+            doc_id = chunk[:newline].strip()
+            content = chunk[newline + 1 :]
+            if not doc_id:
+                continue
+            self._parse_and_add_document(doc_id, content, documents, limit)
+            if limit is not None and len(documents) >= limit:
+                break
 
         self._documents = documents
         self._documents_by_id = {d.id: d for d in documents}
@@ -504,20 +506,20 @@ class SSHClient:
     def _write_remote_json(self, remote_path: str, obj: Dict[str, Any]) -> None:
         """Atomically write a JSON file to the tablet (tempfile + mv).
 
-        Used for both .metadata and .content. Writing to a tempfile then mv'ing
-        means xochitl never observes a half-written file.
+        Used for both .metadata and .content. The payload streams over stdin
+        (no `base64` — the tablet has none); writing to a tempfile then mv'ing
+        means xochitl never observes a half-written file. Streaming also sides
+        steps any shell quoting issues with arbitrary document names.
         """
-        # base64-encode to avoid quoting/escaping nightmares with arbitrary names
-        import base64
-
-        payload = json.dumps(obj, indent=4)
-        encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        # Trailing newline keeps the file well-formed like xochitl's own writes,
+        # so the listing's `cat`-per-file never abuts the next ===FILE=== marker.
+        payload = (json.dumps(obj, indent=4) + "\n").encode("utf-8")
         tmp_path = f"{remote_path}.tmp"
-        cmd = (
-            f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(tmp_path)} "
-            f"&& mv {shlex.quote(tmp_path)} {shlex.quote(remote_path)}"
+        self._ssh_pipe(
+            payload,
+            f"cat > {shlex.quote(tmp_path)} && mv {shlex.quote(tmp_path)} "
+            f"{shlex.quote(remote_path)}",
         )
-        self._ssh_command(cmd, timeout=15)
 
     def _write_metadata(self, doc_id: str, metadata: Dict[str, Any]) -> None:
         """Atomically write a document's .metadata JSON back to the tablet."""
