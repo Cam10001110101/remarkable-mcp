@@ -130,13 +130,16 @@ def strokes_to_lines(
     *,
     tool: si.Pen = si.Pen.FINELINER_2,
     color: si.PenColor = si.PenColor.BLACK,
-    base_width: int = 2,
-    base_pressure: int = 120,
-    thickness_scale: float = 1.6,
+    base_width: int = 11,
+    base_pressure: int = 190,
+    thickness_scale: float = 1.0,
     seed: int = 1,
 ) -> List[si.Line]:
-    """Convert polylines to rmscene Line strokes with varying pressure/width
-    (pen accelerates/decelerates → thin-thick-thin) for a non-computerized feel."""
+    """Convert polylines to rmscene Line strokes, calibrated against real device
+    strokes (v6 line v2: ``width`` ~8-12, ``pressure`` uint8, nonzero ``speed``,
+    and a per-point travel ``direction``). Defaults at ~0 made the ink a faint
+    hairline on-device. Width/pressure taper slightly mid-stroke for a hand feel.
+    """
     rng = random.Random(seed)
     lines: List[si.Line] = []
     for stroke in strokes:
@@ -147,11 +150,16 @@ def strokes_to_lines(
         for i, (x, y) in enumerate(stroke):
             t = i / max(1, n - 1)
             taper = math.sin(math.pi * t)  # 0 at ends, 1 in middle
-            pressure = int(max(20, min(255, base_pressure * (0.55 + 0.45 * taper)
-                                       + rng.gauss(0, 8))))
+            if i < n - 1:
+                ddx, ddy = stroke[i + 1][0] - x, stroke[i + 1][1] - y
+            else:
+                ddx, ddy = x - stroke[i - 1][0], y - stroke[i - 1][1]
+            direction = int((math.atan2(ddy, ddx) % (2 * math.pi)) / (2 * math.pi) * 255) & 0xFF
+            pressure = int(max(60, min(255, base_pressure * (0.8 + 0.2 * taper) + rng.gauss(0, 8))))
             width = int(max(1, base_width + round(taper)))
-            points.append(si.Point(x=float(x), y=float(y), speed=0, direction=0,
-                                   width=width, pressure=pressure))
+            speed = int(max(0, 26 + rng.gauss(0, 6)))
+            points.append(si.Point(x=float(x), y=float(y), speed=speed,
+                                   direction=direction, width=width, pressure=pressure))
         lines.append(si.Line(color=color, tool=tool, points=points,
                              thickness_scale=thickness_scale, starting_length=0.0))
     return lines
