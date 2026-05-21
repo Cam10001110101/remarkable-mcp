@@ -1286,7 +1286,7 @@ class TestSamplingOCR:
         """Test default OCR backend is auto."""
         import os
 
-        from remarkable_mcp.sampling import get_ocr_backend
+        from remarkable_mcp.ocr import get_ocr_backend
 
         # Clear any env var
         env_backup = os.environ.get("REMARKABLE_OCR_BACKEND")
@@ -1304,7 +1304,7 @@ class TestSamplingOCR:
         """Test OCR backend can be set to sampling."""
         import os
 
-        from remarkable_mcp.sampling import get_ocr_backend
+        from remarkable_mcp.ocr import get_ocr_backend
 
         env_backup = os.environ.get("REMARKABLE_OCR_BACKEND")
         os.environ["REMARKABLE_OCR_BACKEND"] = "sampling"
@@ -1324,7 +1324,7 @@ class TestSamplingOCR:
 
         from mcp.types import ClientCapabilities, SamplingCapability
 
-        from remarkable_mcp.sampling import should_use_sampling_ocr
+        from remarkable_mcp.ocr import should_use_sampling_ocr
 
         env_backup = os.environ.get("REMARKABLE_OCR_BACKEND")
         if "REMARKABLE_OCR_BACKEND" in os.environ:
@@ -1351,7 +1351,7 @@ class TestSamplingOCR:
 
         from mcp.types import ClientCapabilities, SamplingCapability
 
-        from remarkable_mcp.sampling import should_use_sampling_ocr
+        from remarkable_mcp.ocr import should_use_sampling_ocr
 
         env_backup = os.environ.get("REMARKABLE_OCR_BACKEND")
         os.environ["REMARKABLE_OCR_BACKEND"] = "sampling"
@@ -1378,7 +1378,7 @@ class TestSamplingOCR:
 
         from mcp.types import ClientCapabilities
 
-        from remarkable_mcp.sampling import should_use_sampling_ocr
+        from remarkable_mcp.ocr import should_use_sampling_ocr
 
         env_backup = os.environ.get("REMARKABLE_OCR_BACKEND")
         os.environ["REMARKABLE_OCR_BACKEND"] = "sampling"
@@ -1426,13 +1426,12 @@ class TestSamplingOCR:
 
     def test_sampling_imports_from_module(self):
         """Test that sampling utilities can be imported."""
+        from remarkable_mcp.ocr import get_ocr_backend, should_use_sampling_ocr
         from remarkable_mcp.sampling import (
             OCR_SYSTEM_PROMPT,
             OCR_USER_PROMPT,
-            get_ocr_backend,
             ocr_pages_via_sampling,
             ocr_via_sampling,
-            should_use_sampling_ocr,
         )
 
         # Verify all functions/constants are accessible
@@ -1442,6 +1441,55 @@ class TestSamplingOCR:
         assert callable(should_use_sampling_ocr)
         assert isinstance(OCR_SYSTEM_PROMPT, str)
         assert isinstance(OCR_USER_PROMPT, str)
+
+
+class TestOcrConfig:
+    """Config + reachability for the unified OCR module."""
+
+    def test_get_ocr_backend_default_and_env(self):
+        import os
+
+        from remarkable_mcp.ocr import get_ocr_backend
+
+        os.environ.pop("REMARKABLE_OCR_BACKEND", None)
+        try:
+            assert get_ocr_backend() == "auto"
+            os.environ["REMARKABLE_OCR_BACKEND"] = "OLLAMA"
+            assert get_ocr_backend() == "ollama"
+        finally:
+            os.environ.pop("REMARKABLE_OCR_BACKEND", None)
+
+    def test_ollama_config_defaults(self):
+        import os
+
+        from remarkable_mcp import ocr
+
+        for k in (
+            "REMARKABLE_OLLAMA_MODEL",
+            "REMARKABLE_OLLAMA_HOST",
+            "OLLAMA_HOST",
+            "REMARKABLE_OLLAMA_TIMEOUT",
+        ):
+            os.environ.pop(k, None)
+        assert ocr.get_ollama_model() == "gemma4:31b"
+        assert ocr.get_ollama_host() == "http://localhost:11434"
+        assert ocr.get_ollama_timeout() == 180
+
+    def test_ollama_available_true_false_and_cache(self):
+        from unittest.mock import MagicMock, patch
+
+        from remarkable_mcp import ocr
+
+        ocr._reset_ollama_cache()
+        with patch("remarkable_mcp.ocr.requests.get") as g:
+            g.return_value = MagicMock(status_code=200)
+            assert ocr.ollama_available() is True
+            assert ocr.ollama_available() is True  # cached, no second call
+            assert g.call_count == 1
+        ocr._reset_ollama_cache()
+        with patch("remarkable_mcp.ocr.requests.get", side_effect=Exception("refused")):
+            assert ocr.ollama_available() is False
+        ocr._reset_ollama_cache()
 
 
 # =============================================================================

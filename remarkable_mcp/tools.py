@@ -48,11 +48,8 @@ from remarkable_mcp.extract import (
     render_page_from_document_zip_svg,
 )
 from remarkable_mcp.responses import make_error, make_response
-from remarkable_mcp.sampling import (
-    get_ocr_backend,
-    ocr_via_sampling,
-    should_use_sampling_ocr,
-)
+from remarkable_mcp.ocr import get_ocr_backend, should_use_sampling_ocr
+from remarkable_mcp.sampling import ocr_via_sampling
 from remarkable_mcp.server import mcp
 
 
