@@ -1743,16 +1743,109 @@ class TestSSHWriteOperations:
         decoded = json.loads(_b64.b64decode(encoded).decode())
         assert decoded["parent"] == "new-parent-uuid"
 
+    def test_upload_writes_payload_metadata_content_and_restarts(self):
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient()
+        with patch.object(client, "_scp_upload") as mock_scp, patch.object(
+            client, "_ssh_command", return_value=""
+        ) as mock_cmd:
+            result = client.upload(
+                b"%PDF-1.4 data", filename="paper.pdf", parent_id="folder-uuid"
+            )
+
+        assert result["fileType"] == "pdf"
+        assert result["parent"] == "folder-uuid"
+        assert result["name"] == "paper"
+        assert result["transport"] == "ssh"
+
+        # The binary payload was streamed to {uuid}.pdf via _scp_upload.
+        assert mock_scp.call_args.args[0] == b"%PDF-1.4 data"
+        assert mock_scp.call_args.args[1].endswith(f"{result['id']}.pdf")
+
+        # Decode every base64 JSON blob written over SSH: one .content (fileType
+        # pdf) and one .metadata (DocumentType under our parent). Plus a restart.
+        import base64 as _b64
+        import re
+
+        cmds = [c.args[0] for c in mock_cmd.call_args_list]
+        assert any("systemctl restart xochitl" in c for c in cmds)
+        blobs = []
+        for c in cmds:
+            m = re.search(r"echo '?([A-Za-z0-9+/=]+)'? \| base64 -d", c)
+            if m:
+                blobs.append(json.loads(_b64.b64decode(m.group(1)).decode()))
+        assert any(b.get("fileType") == "pdf" for b in blobs)
+        meta = [b for b in blobs if b.get("type") == "DocumentType"]
+        assert meta and meta[0]["parent"] == "folder-uuid"
+        assert meta[0]["visibleName"] == "paper"
+
+    def test_create_notebook_generates_pdf_and_uploads_via_ssh(self):
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient()
+        with patch.object(client, "_scp_upload") as mock_scp, patch.object(
+            client, "_ssh_command", return_value=""
+        ):
+            result = client.create_notebook("Notes", pages=2, parent_id="p1")
+
+        assert result["name"] == "Notes"
+        assert result["pages"] == 2
+        assert result["parent"] == "p1"
+        assert result["transport"] == "ssh"
+
+        uploaded = mock_scp.call_args.args[0]
+        assert uploaded.startswith(b"%PDF")
+        import fitz
+
+        doc = fitz.open(stream=uploaded, filetype="pdf")
+        assert doc.page_count == 2
+        doc.close()
+
+    def test_upload_rejects_unsupported_extension(self):
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient()
+        with pytest.raises(RuntimeError, match="supports .pdf and .epub"):
+            client.upload(b"data", filename="note.rmdoc")
+
+
+class TestWriteToolParity:
+    """Lock the write-method set per backend so the two transports can't silently
+    drift. Changing these sets is intentional — update the parity matrix in
+    docs/tools.md to match."""
+
+    def test_backend_write_method_sets(self):
+        from remarkable_mcp.ssh import SSHClient
+        from remarkable_mcp.usb_web import USBWebClient
+
+        ssh_writes = {"upload", "create_notebook", "create_folder", "move", "delete"}
+        usb_writes = {"upload", "create_notebook"}
+
+        for m in ssh_writes:
+            assert callable(getattr(SSHClient, m, None)), f"SSHClient missing {m}"
+        for m in usb_writes:
+            assert callable(getattr(USBWebClient, m, None)), f"USBWebClient missing {m}"
+
+        # USB web genuinely lacks folder/move/delete endpoints — assert they stay
+        # absent so we never ship a stub that pretends to work.
+        for m in ("create_folder", "move", "delete"):
+            assert getattr(USBWebClient, m, None) is None, (
+                f"USBWebClient unexpectedly has '{m}'. If intentional, update the "
+                "parity matrix in docs/tools.md and this test together."
+            )
+
 
 class TestWriteToolGuards:
     """Test that write tools refuse to run in the wrong transport mode."""
 
     @pytest.mark.asyncio
-    async def test_upload_refuses_when_not_usb_web(self):
+    async def test_upload_refuses_in_cloud_mode(self):
         import os
         import sys
 
-        # Force cloud mode (the default when neither flag is set)
+        # Force cloud mode (the default when neither flag is set). upload works
+        # in SSH or USB-web, so it should only refuse here in cloud mode.
         for var in ("REMARKABLE_USE_USB_WEB", "REMARKABLE_USE_SSH"):
             os.environ.pop(var, None)
         if "remarkable_mcp.api" in sys.modules:
@@ -1765,7 +1858,8 @@ class TestWriteToolGuards:
         result = await mcp.call_tool("remarkable_upload", {"file_path": "/tmp/x.pdf"})
         data = json.loads(result[0][0].text)
         assert "_error" in data
-        assert "USB web" in str(data)
+        assert "write transport" in str(data)
+        assert "cloud mode" in str(data)
 
     @pytest.mark.asyncio
     async def test_delete_refuses_when_not_ssh(self):

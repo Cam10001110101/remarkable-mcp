@@ -191,6 +191,44 @@ class SSHClient:
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"SSH cat timed out after {timeout}s")
 
+    def _scp_upload(self, data: bytes, remote_path: str, timeout: int = 120) -> None:
+        """Upload raw bytes to a remote path via SSH (`cat > file` over stdin).
+
+        Mirrors _scp_download. Piping through stdin avoids ARG_MAX limits and
+        base64 overhead, so it handles real PDFs/EPUBs, not just tiny metadata.
+        """
+        ssh_args = [
+            "ssh",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-p",
+            str(self.port),
+            f"{self.user}@{self.host}",
+            f"cat > {shlex.quote(remote_path)}",
+        ]
+
+        # If no password, use BatchMode for key-based auth
+        if not self.password:
+            ssh_args.insert(1, "-o")
+            ssh_args.insert(2, "BatchMode=yes")
+        else:
+            # Use sshpass for password authentication
+            ssh_args = ["sshpass", "-p", self.password] + ssh_args
+
+        try:
+            result = subprocess.run(
+                ssh_args,
+                input=data,
+                capture_output=True,
+                timeout=timeout,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"SSH upload failed: {result.stderr.decode()}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"SSH upload timed out after {timeout}s")
+
     def check_connection(self) -> bool:
         """Check if SSH connection to tablet is available."""
         try:
@@ -463,21 +501,27 @@ class SSHClient:
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Could not parse metadata for {doc_id}: {e}")
 
-    def _write_metadata(self, doc_id: str, metadata: Dict[str, Any]) -> None:
-        """Atomically write a document's .metadata JSON back to the tablet."""
-        path = f"{XOCHITL_PATH}/{doc_id}.metadata"
-        # Write via a tempfile + mv so xochitl never sees a half-written file.
-        tmp_path = f"{path}.tmp"
-        payload = json.dumps(metadata, indent=4)
+    def _write_remote_json(self, remote_path: str, obj: Dict[str, Any]) -> None:
+        """Atomically write a JSON file to the tablet (tempfile + mv).
+
+        Used for both .metadata and .content. Writing to a tempfile then mv'ing
+        means xochitl never observes a half-written file.
+        """
         # base64-encode to avoid quoting/escaping nightmares with arbitrary names
         import base64
 
+        payload = json.dumps(obj, indent=4)
         encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        tmp_path = f"{remote_path}.tmp"
         cmd = (
             f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(tmp_path)} "
-            f"&& mv {shlex.quote(tmp_path)} {shlex.quote(path)}"
+            f"&& mv {shlex.quote(tmp_path)} {shlex.quote(remote_path)}"
         )
         self._ssh_command(cmd, timeout=15)
+
+    def _write_metadata(self, doc_id: str, metadata: Dict[str, Any]) -> None:
+        """Atomically write a document's .metadata JSON back to the tablet."""
+        self._write_remote_json(f"{XOCHITL_PATH}/{doc_id}.metadata", metadata)
 
     def _restart_xochitl(self) -> None:
         """Restart xochitl so it picks up filesystem-level metadata changes."""
@@ -532,6 +576,130 @@ class SSHClient:
         self._documents = []
         self._documents_by_id = {}
         return {"id": doc_id, "parent": new_parent_id, "transport": "ssh"}
+
+    def upload(
+        self,
+        file_data: bytes,
+        filename: str,
+        content_type: Optional[str] = None,
+        parent_id: str = "",
+        page_count: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Upload a PDF or EPUB to the tablet via SSH (filesystem + xochitl restart).
+
+        Unlike the USB web interface — which forces every upload into the
+        "Clippings Import" folder — the SSH path writes the document straight
+        into any folder by setting `parent` in the metadata.
+
+        Writes three files into xochitl's storage ({uuid}.{ext}, {uuid}.metadata
+        as DocumentType, {uuid}.content) then restarts xochitl to pick them up.
+
+        Args:
+            file_data: Raw file bytes.
+            filename: Filename including extension; the extension sets fileType.
+            content_type: Unused over SSH (kept for signature parity with the
+                USB-web client); fileType is derived from the extension.
+            parent_id: Destination folder UUID. Empty string places at root.
+            page_count: Optional page count to seed .content. xochitl recomputes
+                this on first open, so it is only a hint.
+
+        Returns:
+            Dict {"id", "name", "parent", "fileType", "transport": "ssh"}.
+        """
+        import uuid as _uuid
+
+        ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+        if ext not in ("pdf", "epub"):
+            raise RuntimeError(
+                f"SSH upload supports .pdf and .epub, got '.{ext}'. "
+                "(.rmdoc archives must be uploaded via USB web mode.)"
+            )
+
+        doc_id = str(_uuid.uuid4())
+        now_ms = str(int(time.time() * 1000))
+        visible_name = filename.rsplit(".", 1)[0]
+
+        # 1. The document payload itself (binary, piped over stdin).
+        self._scp_upload(file_data, f"{XOCHITL_PATH}/{doc_id}.{ext}")
+
+        # 2. .content — tells xochitl how to render the file. Minimal but
+        #    sufficient; xochitl derives the rest (e.g. real page count) from
+        #    the file on first open.
+        content = {
+            "fileType": ext,
+            "formatVersion": 1,
+            "lineHeight": -1,
+            "margins": 125,
+            "orientation": "portrait",
+            "pageCount": page_count or 0,
+            "textScale": 1,
+            "extraMetadata": {},
+        }
+        self._write_remote_json(f"{XOCHITL_PATH}/{doc_id}.content", content)
+
+        # 3. .metadata — makes it appear in the library under `parent`.
+        metadata = {
+            "createdTime": now_ms,
+            "lastModified": now_ms,
+            "lastOpened": now_ms,
+            "lastOpenedPage": 0,
+            "metadatamodified": False,
+            "modified": False,
+            "new": True,
+            "parent": parent_id,
+            "pinned": False,
+            "synced": False,
+            "type": "DocumentType",
+            "version": 0,
+            "visibleName": visible_name,
+        }
+        self._write_metadata(doc_id, metadata)
+
+        self._restart_xochitl()
+        self._documents = []
+        self._documents_by_id = {}
+        return {
+            "id": doc_id,
+            "name": visible_name,
+            "parent": parent_id,
+            "fileType": ext,
+            "transport": "ssh",
+        }
+
+    def create_notebook(
+        self, name: str, pages: int = 1, parent_id: str = ""
+    ) -> Dict[str, Any]:
+        """
+        Create a new blank annotatable document on the tablet via SSH.
+
+        Generates a blank PDF (shared with the USB-web backend via
+        remarkable_mcp.pdf.blank_pdf_bytes) and uploads it. The result is
+        annotatable with the pen and behaves like any other PDF. Because this
+        uses the SSH path, the notebook can be placed directly into `parent_id`
+        rather than landing in "Clippings Import".
+
+        Args:
+            name: Notebook name as it will appear on the tablet.
+            pages: Number of blank pages (default 1).
+            parent_id: Destination folder UUID. Empty string places at root.
+
+        Returns:
+            Dict {"name", "pages", "id", "parent", "transport": "ssh"}.
+        """
+        from remarkable_mcp.pdf import blank_pdf_bytes
+
+        pdf_bytes = blank_pdf_bytes(pages)
+        result = self.upload(
+            pdf_bytes, filename=f"{name}.pdf", parent_id=parent_id, page_count=pages
+        )
+        return {
+            "name": name,
+            "pages": pages,
+            "id": result["id"],
+            "parent": parent_id,
+            "transport": "ssh",
+        }
 
     def get_all_file_types(self) -> dict[str, Optional[str]]:
         """
