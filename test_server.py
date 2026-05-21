@@ -2260,6 +2260,42 @@ class TestSSHWriteOperations:
             "systemctl restart xochitl" in c.args[0] for c in mock_cmd.call_args_list
         )
 
+    def test_restart_xochitl_recovers_from_systemd_start_limit(self):
+        """A burst of write ops trips systemd's start-limit; the restart must
+        reset-failed and start again instead of leaving xochitl dead (frozen tablet)."""
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient()
+        calls = []
+
+        def fake(cmd, timeout=30):
+            calls.append(cmd)
+            if cmd == "systemctl restart xochitl":
+                raise RuntimeError(
+                    "SSH command failed: Job for xochitl.service failed because "
+                    "start of the service was attempted too often."
+                )
+            return ""
+
+        with patch.object(client, "_ssh_command", side_effect=fake):
+            client._restart_xochitl()  # must NOT raise
+
+        assert any("reset-failed xochitl.service" in c for c in calls)
+        assert any("systemctl start xochitl.service" in c for c in calls)
+
+    def test_restart_xochitl_propagates_unrelated_errors(self):
+        """Non start-limit failures (e.g. connection loss) must not be swallowed."""
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient()
+        with patch.object(
+            client,
+            "_ssh_command",
+            side_effect=RuntimeError("SSH command failed: connect to host ...: Operation timed out"),
+        ):
+            with pytest.raises(RuntimeError, match="Operation timed out"):
+                client._restart_xochitl()
+
     def test_create_notebook_generates_pdf_and_uploads_via_ssh(self):
         from remarkable_mcp.ssh import SSHClient
 
