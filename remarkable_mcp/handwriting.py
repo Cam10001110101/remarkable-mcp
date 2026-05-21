@@ -47,22 +47,22 @@ Stroke = List[Tuple[float, float]]  # a polyline in device coordinates
 # survey. `color` is a `PenColor`; highlighter uses the translucent HIGHLIGHT color.
 PEN_PRESETS = {
     "ballpoint": dict(tool=si.Pen.BALLPOINT_2, color=si.PenColor.BLACK,
-                      base_width=16, base_pressure=220, thickness_scale=2.0),
+                      base_width=13, base_pressure=210, thickness_scale=1.6),
     "fineliner": dict(tool=si.Pen.FINELINER_2, color=si.PenColor.BLACK,
-                      base_width=13, base_pressure=210, thickness_scale=2.0),
+                      base_width=11, base_pressure=200, thickness_scale=1.6),
     "marker": dict(tool=si.Pen.MARKER_2, color=si.PenColor.BLACK,
-                   base_width=24, base_pressure=220, thickness_scale=2.5),
+                   base_width=20, base_pressure=210, thickness_scale=2.0),
     "pencil": dict(tool=si.Pen.PENCIL_2, color=si.PenColor.BLACK,
-                   base_width=14, base_pressure=190, thickness_scale=2.0),
+                   base_width=12, base_pressure=185, thickness_scale=1.6),
     "mechanical_pencil": dict(tool=si.Pen.MECHANICAL_PENCIL_2, color=si.PenColor.BLACK,
-                              base_width=10, base_pressure=200, thickness_scale=1.5),
+                              base_width=9, base_pressure=195, thickness_scale=1.3),
     "paintbrush": dict(tool=si.Pen.PAINTBRUSH_2, color=si.PenColor.BLACK,
-                       base_width=32, base_pressure=230, thickness_scale=1.0),
+                       base_width=28, base_pressure=220, thickness_scale=1.0),
     "calligraphy": dict(tool=si.Pen.CALIGRAPHY, color=si.PenColor.BLACK,
-                        base_width=18, base_pressure=220, thickness_scale=2.0),
+                        base_width=15, base_pressure=210, thickness_scale=1.6),
     # Highlighter is for emphasis, not writing prose; wide + translucent.
     "highlighter": dict(tool=si.Pen.HIGHLIGHTER_2, color=si.PenColor.HIGHLIGHT,
-                        base_width=30, base_pressure=200, thickness_scale=3.0),
+                        base_width=28, base_pressure=195, thickness_scale=2.6),
 }
 DEFAULT_PEN = "ballpoint"
 
@@ -155,9 +155,9 @@ def strokes_to_lines(
     *,
     tool: si.Pen = si.Pen.BALLPOINT_2,
     color: si.PenColor = si.PenColor.BLACK,
-    base_width: int = 16,
-    base_pressure: int = 220,
-    thickness_scale: float = 2.0,
+    base_width: int = 13,
+    base_pressure: int = 210,
+    thickness_scale: float = 1.6,
     seed: int = 1,
 ) -> List[si.Line]:
     """Convert polylines to rmscene Line strokes, calibrated against real device
