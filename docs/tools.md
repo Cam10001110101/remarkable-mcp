@@ -28,6 +28,33 @@ This document provides detailed documentation for all MCP tools provided by rema
 Read tools return structured JSON with hints for logical next actions. Cloud mode
 is read-only; write tools are unavailable there.
 
+## Write Tool Parity
+
+Write-tool availability depends on the active connection mode. The two write
+transports reach the tablet differently, so they expose different capabilities:
+
+| Tool | SSH | USB-web | Cloud | Notes |
+|------|:---:|:------:|:-----:|-------|
+| `remarkable_upload` | ✅ | ✅ | ❌ | SSH places the file in any `dest_folder`; USB-web always lands in "Clippings Import". USB-web also accepts `.rmdoc`; SSH accepts `.pdf`/`.epub`. |
+| `remarkable_create_notebook` | ✅ | ✅ | ❌ | Creates a blank PDF (annotatable). SSH honors `dest_folder`; USB-web lands in "Clippings Import". |
+| `remarkable_create_folder` | ✅ | ❌ | ❌ | USB web interface exposes no folder-creation endpoint. |
+| `remarkable_move` | ✅ | ❌ | ❌ | USB web interface exposes no move endpoint. |
+| `remarkable_delete` | ✅ | ❌ | ❌ | USB web interface exposes no delete endpoint. Reversible — moves to Trash. |
+
+**How each transport writes:**
+
+- **SSH** edits xochitl's on-device files directly (`{uuid}.metadata`,
+  `{uuid}.content`, and the document payload) and restarts xochitl so the change
+  appears (~5s UI pause). Requires developer mode. This is why SSH can do
+  everything, including placing items in a specific folder.
+- **USB-web** uses the tablet's official HTTP `POST /upload` endpoint, which only
+  accepts new files and always deposits them in "Clippings Import". There are no
+  HTTP endpoints for move/delete/folder operations, so those are SSH-only.
+- **Cloud** is read-only in this server.
+
+> This matrix is enforced by `TestWriteToolParity` in `test_server.py` — the two
+> backends cannot silently drift out of sync with this table.
+
 ## Root Path Filtering
 
 All tools respect the `REMARKABLE_ROOT_PATH` environment variable. When configured, operations are scoped to that folder:

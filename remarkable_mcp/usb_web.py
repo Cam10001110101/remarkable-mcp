@@ -415,21 +415,9 @@ class USBWebClient:
         Returns:
             Dict {"name": ..., "pages": N, "raw": <upload response>}.
         """
-        try:
-            import fitz  # PyMuPDF
-        except ImportError:
-            raise RuntimeError(
-                "create_notebook requires PyMuPDF (already a project dependency). "
-                "Run: uv sync"
-            )
+        from remarkable_mcp.pdf import blank_pdf_bytes
 
-        # reMarkable native page size in points (1404x1872 px @ 226 dpi → ~497x663pt)
-        pdf = fitz.open()
-        for _ in range(max(1, pages)):
-            pdf.new_page(width=497, height=663)
-        pdf_bytes = pdf.tobytes()
-        pdf.close()
-
+        pdf_bytes = blank_pdf_bytes(pages)
         result = self.upload(pdf_bytes, filename=f"{name}.pdf", content_type="application/pdf")
         return {"name": name, "pages": pages, "raw": result}
 

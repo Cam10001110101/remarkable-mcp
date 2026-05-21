@@ -1,10 +1,12 @@
 """
 MCP Tools for reMarkable tablet access.
 
-Most tools are read-only. Write tools (upload, create_folder, create_notebook,
+Most tools are read-only. Write tools (upload, create_notebook, create_folder,
 move, delete) modify the tablet's library — see their individual annotations
-for destructive/idempotent flags. Write tools require either USB-web mode
-(upload, create_folder, create_notebook) or SSH mode (move, delete).
+for destructive/idempotent flags. Write-tool availability depends on transport:
+upload and create_notebook work in SSH or USB-web mode; create_folder, move, and
+delete are SSH-only (the USB web interface exposes no such endpoints); cloud mode
+is read-only.
 """
 
 import base64
@@ -1743,17 +1745,27 @@ def _resolve_by_name(client, name: str, want_folder: Optional[bool] = None):
     return None
 
 
-def _require_usb_web():
-    """Raise a structured error if the active transport isn't usb-web."""
+def _require_write_transport():
+    """Raise a structured error if neither SSH nor USB-web is active.
+
+    upload/create_notebook work over either transport; only cloud mode (the
+    default) lacks a write path.
+    """
     from remarkable_mcp.api import REMARKABLE_USE_SSH, REMARKABLE_USE_USB_WEB
 
-    if not REMARKABLE_USE_USB_WEB:
-        active = "ssh" if REMARKABLE_USE_SSH else "cloud"
+    if not (REMARKABLE_USE_SSH or REMARKABLE_USE_USB_WEB):
         raise RuntimeError(
-            f"This tool requires the USB web interface, but {active} mode is "
-            "active. Restart the MCP server with --usb (or set "
-            "REMARKABLE_USE_USB_WEB=1) to use upload/create tools."
+            "This tool requires a write transport, but cloud mode is active. "
+            "Restart the MCP server with --ssh (developer mode) or --usb (USB "
+            "web interface) to use upload/create tools."
         )
+
+
+def _is_ssh_active() -> bool:
+    """True if the active transport is SSH (vs USB-web/cloud)."""
+    from remarkable_mcp.api import REMARKABLE_USE_SSH
+
+    return REMARKABLE_USE_SSH
 
 
 def _require_ssh():
@@ -1772,27 +1784,30 @@ def _require_ssh():
 
 
 @mcp.tool(annotations=UPLOAD_ANNOTATIONS)
-def remarkable_upload(file_path: str) -> str:
+def remarkable_upload(file_path: str, dest_folder: Optional[str] = None) -> str:
     """
-    <usecase>Upload a PDF, EPUB, or .rmdoc file to the reMarkable tablet.</usecase>
+    <usecase>Upload a PDF or EPUB file to the reMarkable tablet.</usecase>
     <instructions>
-    Sends the file to the tablet via the USB web interface. The tablet
-    automatically lands all USB uploads in its "Clippings Import" folder —
-    this is xochitl's behavior and cannot be overridden via /upload. To move
-    the file elsewhere afterward, use remarkable_move (requires SSH mode).
+    Works in SSH or USB-web mode (cloud mode is read-only).
 
-    Requires USB web mode (--usb / REMARKABLE_USE_USB_WEB=1).
+    - SSH mode: the file is written straight into `dest_folder` (or the root if
+      omitted), and the tablet UI restarts briefly (~5s) to pick it up.
+    - USB-web mode: the tablet lands every upload in its "Clippings Import"
+      folder — `dest_folder` is ignored; use remarkable_move (SSH) afterward.
+      USB-web additionally accepts .rmdoc archives.
     </instructions>
     <parameters>
     - file_path: Absolute path to the file on the host machine.
+    - dest_folder: Optional destination folder name (SSH mode only).
     </parameters>
     <examples>
     - remarkable_upload("/Users/me/paper.pdf")
+    - remarkable_upload("/Users/me/paper.pdf", dest_folder="Reading")
     - remarkable_upload("/tmp/book.epub")
     </examples>
     """
     try:
-        _require_usb_web()
+        _require_write_transport()
         path = Path(file_path).expanduser()
         if not path.is_file():
             return make_error(
@@ -1801,16 +1816,47 @@ def remarkable_upload(file_path: str) -> str:
                 suggestion="Provide an absolute path to a readable file.",
             )
         client = get_rmapi()
-        result = client.upload(path.read_bytes(), filename=path.name)
+
+        if _is_ssh_active():
+            parent_id = ""
+            if dest_folder:
+                folder = _resolve_by_name(client, dest_folder, want_folder=True)
+                if not folder:
+                    return make_error(
+                        error_type="folder_not_found",
+                        message=f"Destination folder not found: '{dest_folder}'",
+                        suggestion="Use remarkable_browse('/') to list folders.",
+                    )
+                parent_id = folder.ID
+            result = client.upload(
+                path.read_bytes(), filename=path.name, parent_id=parent_id
+            )
+            lands_in = dest_folder or "root"
+            hint = (
+                f"Uploaded {path.name} to {lands_in}. Tablet UI restarts briefly "
+                "to pick up the change."
+            )
+        else:
+            result = client.upload(path.read_bytes(), filename=path.name)
+            lands_in = "Clippings Import"
+            hint = (
+                f"Uploaded {path.name}. Lands in 'Clippings Import' — use "
+                "remarkable_move (SSH mode) to relocate."
+            )
+            if dest_folder:
+                hint += (
+                    f" (dest_folder '{dest_folder}' ignored: USB uploads always "
+                    "land in Clippings Import.)"
+                )
+
         return make_response(
             {
                 "uploaded": path.name,
                 "size_bytes": path.stat().st_size,
-                "lands_in": "Clippings Import",
+                "lands_in": lands_in,
                 "result": result,
             },
-            f"Uploaded {path.name}. Lands in 'Clippings Import' — use "
-            "remarkable_move (SSH mode) to relocate.",
+            hint,
         )
     except Exception as e:
         return make_error(
@@ -1877,53 +1923,87 @@ def remarkable_create_folder(name: str, parent_folder: Optional[str] = None) -> 
 
 
 @mcp.tool(annotations=CREATE_NOTEBOOK_ANNOTATIONS)
-def remarkable_create_notebook(name: str, pages: int = 1) -> str:
+def remarkable_create_notebook(
+    name: str, pages: int = 1, dest_folder: Optional[str] = None
+) -> str:
     """
     <usecase>Create a new blank annotatable document on the reMarkable tablet.</usecase>
     <instructions>
-    Generates a blank PDF with the requested page count and uploads it via
-    the USB web interface. The result is an annotatable document (write on
-    it with the pen) that behaves like any other PDF.
+    Generates a blank PDF with the requested page count and adds it to the
+    tablet. The result is an annotatable document (write on it with the pen)
+    that behaves like any other PDF. Works in SSH or USB-web mode.
 
-    The tablet always lands USB uploads in "Clippings Import" — to move the
-    document elsewhere, use remarkable_move (SSH mode) afterward.
+    - SSH mode: the notebook is placed directly in `dest_folder` (or root) and
+      the tablet UI restarts briefly (~5s).
+    - USB-web mode: the tablet lands it in "Clippings Import"; `dest_folder` is
+      ignored — use remarkable_move (SSH) to relocate.
 
     Note: this creates a PDF, not a native .rm notebook. The native .rm v6
     binary stroke format is reverse-engineered and firmware-fragile; the
     PDF approach is bullet-proof and indistinguishable for most use cases.
-
-    Requires USB web mode (--usb).
     </instructions>
     <parameters>
     - name: Notebook name as it will appear on the tablet.
     - pages: Number of blank pages (default: 1, max: 200).
+    - dest_folder: Optional destination folder name (SSH mode only).
     </parameters>
     <examples>
     - remarkable_create_notebook("Meeting Notes")
     - remarkable_create_notebook("Sketches", pages=10)
+    - remarkable_create_notebook("Q2 Plan", dest_folder="Work")
     </examples>
     """
     try:
-        _require_usb_web()
+        from remarkable_mcp.pdf import MAX_NOTEBOOK_PAGES
+
+        _require_write_transport()
         if not name or not name.strip():
             return make_error(
                 error_type="invalid_name",
                 message="Notebook name cannot be empty.",
                 suggestion="Pass a non-empty name.",
             )
-        if pages < 1 or pages > 200:
+        if pages < 1 or pages > MAX_NOTEBOOK_PAGES:
             return make_error(
                 error_type="invalid_pages",
-                message=f"pages must be 1..200, got {pages}.",
-                suggestion="Pass pages between 1 and 200.",
+                message=f"pages must be 1..{MAX_NOTEBOOK_PAGES}, got {pages}.",
+                suggestion=f"Pass pages between 1 and {MAX_NOTEBOOK_PAGES}.",
             )
         client = get_rmapi()
-        result = client.create_notebook(name.strip(), pages=pages)
-        return make_response(
-            {**result, "lands_in": "Clippings Import"},
-            f"Created notebook '{name}' ({pages} page{'s' if pages != 1 else ''}). "
-            "Lands in 'Clippings Import' — use remarkable_move (SSH) to relocate.",
-        )
+        page_word = f"{pages} page{'s' if pages != 1 else ''}"
+
+        if _is_ssh_active():
+            parent_id = ""
+            if dest_folder:
+                folder = _resolve_by_name(client, dest_folder, want_folder=True)
+                if not folder:
+                    return make_error(
+                        error_type="folder_not_found",
+                        message=f"Destination folder not found: '{dest_folder}'",
+                        suggestion="Use remarkable_browse('/') to list folders.",
+                    )
+                parent_id = folder.ID
+            result = client.create_notebook(
+                name.strip(), pages=pages, parent_id=parent_id
+            )
+            lands_in = dest_folder or "root"
+            hint = (
+                f"Created notebook '{name}' ({page_word}) in {lands_in}. "
+                "Tablet UI restarts briefly to pick up the change."
+            )
+        else:
+            result = client.create_notebook(name.strip(), pages=pages)
+            lands_in = "Clippings Import"
+            hint = (
+                f"Created notebook '{name}' ({page_word}). Lands in 'Clippings "
+                "Import' — use remarkable_move (SSH) to relocate."
+            )
+            if dest_folder:
+                hint += (
+                    f" (dest_folder '{dest_folder}' ignored in USB-web mode.)"
+                )
+
+        return make_response({**result, "lands_in": lands_in}, hint)
     except Exception as e:
         return make_error(
             error_type="create_notebook_failed",
