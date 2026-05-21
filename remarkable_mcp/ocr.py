@@ -171,3 +171,68 @@ def ocr_png_google(png: bytes) -> Optional[str]:
 async def ocr_png_sampling(ctx: "Context", png: bytes) -> Optional[str]:
     """Async wrapper over the MCP-sampling OCR primitive in sampling.py."""
     return await ocr_via_sampling(ctx, png)
+
+
+def resolve_page_ocr_engine(ctx: Optional["Context"]) -> Optional[str]:
+    """Which lazy, page-level engine the read path should use: 'sampling', 'ollama', or None.
+
+    None means: no page-level engine selected -> caller uses the batch
+    (extract_handwriting_ocr) path for google/tesseract.
+    """
+    backend = get_ocr_backend()
+    if backend == "sampling" and ctx is not None and client_supports_sampling(ctx):
+        return "sampling"
+    if backend == "ollama" and ollama_available():
+        return "ollama"
+    if backend == "auto" and ollama_available():
+        return "ollama"
+    return None
+
+
+def _sync_fallback_chain() -> list:
+    """Ordered (label, engine) pairs for sync OCR, based on configured backend + reachability."""
+    backend = get_ocr_backend()
+    ollama = ("ollama", ocr_png_ollama)
+    google = ("google", ocr_png_google)
+    tess = ("tesseract", ocr_png_tesseract)
+    if backend == "ollama":
+        return [ollama, google, tess]
+    if backend == "google":
+        return [google, tess]
+    if backend == "tesseract":
+        return [tess]
+    # "auto" (and "sampling" when called from a sync path): prefer local ollama.
+    if ollama_available():
+        return [ollama, google, tess]
+    if os.environ.get("GOOGLE_VISION_API_KEY"):
+        return [google, tess]
+    return [tess]
+
+
+def ocr_png_sync(png: bytes) -> Tuple[Optional[str], Optional[str]]:
+    """Sync dispatcher (no sampling). Returns (text, backend_used) or (None, None)."""
+    for label, engine in _sync_fallback_chain():
+        text = engine(png)
+        if text:
+            return text, label
+    return None, None
+
+
+async def ocr_png(
+    png: bytes, ctx: Optional["Context"] = None
+) -> Tuple[Optional[str], Optional[str]]:
+    """Async dispatcher. Tries sampling first only when explicitly configured + supported,
+    then the sync engine chain (offloaded to a thread so slow inference can't block the loop).
+    Returns (text, backend_used) or (None, None)."""
+    import asyncio
+
+    if get_ocr_backend() == "sampling" and ctx is not None and client_supports_sampling(ctx):
+        text = await ocr_png_sampling(ctx, png)
+        if text:
+            return text, "sampling"
+
+    for label, engine in _sync_fallback_chain():
+        text = await asyncio.to_thread(engine, png)
+        if text:
+            return text, label
+    return None, None

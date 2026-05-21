@@ -1574,6 +1574,73 @@ class TestPngEngines:
             assert ocr.ocr_png_tesseract(b"x") is None
 
 
+class TestOcrDispatcher:
+    """Backend resolution + sync/async dispatch."""
+
+    def setup_method(self):
+        import os
+
+        from remarkable_mcp import ocr
+
+        for k in ("REMARKABLE_OCR_BACKEND", "GOOGLE_VISION_API_KEY"):
+            os.environ.pop(k, None)
+        ocr._reset_ollama_cache()
+
+    def test_resolve_page_engine_auto_prefers_ollama_when_reachable(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        with patch("remarkable_mcp.ocr.ollama_available", return_value=True):
+            assert ocr.resolve_page_ocr_engine(ctx=None) == "ollama"
+        with patch("remarkable_mcp.ocr.ollama_available", return_value=False):
+            assert ocr.resolve_page_ocr_engine(ctx=None) is None
+
+    def test_sync_dispatch_auto_ollama_then_fallback(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        with patch("remarkable_mcp.ocr.ollama_available", return_value=True), patch(
+            "remarkable_mcp.ocr.ocr_png_ollama", return_value=None
+        ), patch("remarkable_mcp.ocr.ocr_png_google", return_value=None), patch(
+            "remarkable_mcp.ocr.ocr_png_tesseract", return_value="T"
+        ):
+            text, backend = ocr.ocr_png_sync(b"x")
+        assert (text, backend) == ("T", "tesseract")
+
+    def test_sync_dispatch_auto_ollama_wins(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        with patch("remarkable_mcp.ocr.ollama_available", return_value=True), patch(
+            "remarkable_mcp.ocr.ocr_png_ollama", return_value="O"
+        ):
+            assert ocr.ocr_png_sync(b"x") == ("O", "ollama")
+
+    def test_sync_dispatch_no_ollama_uses_tesseract(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        with patch("remarkable_mcp.ocr.ollama_available", return_value=False), patch(
+            "remarkable_mcp.ocr.ocr_png_tesseract", return_value="T"
+        ):
+            assert ocr.ocr_png_sync(b"x") == ("T", "tesseract")
+
+    @pytest.mark.asyncio
+    async def test_async_dispatch_auto_ollama(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        with patch("remarkable_mcp.ocr.ollama_available", return_value=True), patch(
+            "remarkable_mcp.ocr.ocr_png_ollama", return_value="O"
+        ):
+            assert await ocr.ocr_png(b"x", ctx=None) == ("O", "ollama")
+
+
 # =============================================================================
 # Test Tag Support
 # =============================================================================
