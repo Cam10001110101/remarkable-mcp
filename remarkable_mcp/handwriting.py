@@ -41,6 +41,31 @@ X_RIGHT = 640.0
 
 Stroke = List[Tuple[float, float]]  # a polyline in device coordinates
 
+# 1:1 map of friendly names to reMarkable's actual v6 tools (rmscene `Pen` enum,
+# the `_2` variants xochitl writes today), with per-tool ink defaults seeded from
+# real on-device strokes (width ~8-11, pressure ~150-200). Refine after a device
+# survey. `color` is a `PenColor`; highlighter uses the translucent HIGHLIGHT color.
+PEN_PRESETS = {
+    "fineliner": dict(tool=si.Pen.FINELINER_2, color=si.PenColor.BLACK,
+                      base_width=11, base_pressure=190, thickness_scale=1.0),
+    "ballpoint": dict(tool=si.Pen.BALLPOINT_2, color=si.PenColor.BLACK,
+                      base_width=9, base_pressure=185, thickness_scale=1.0),
+    "marker": dict(tool=si.Pen.MARKER_2, color=si.PenColor.BLACK,
+                   base_width=16, base_pressure=180, thickness_scale=1.5),
+    "pencil": dict(tool=si.Pen.PENCIL_2, color=si.PenColor.BLACK,
+                   base_width=10, base_pressure=150, thickness_scale=1.0),
+    "mechanical_pencil": dict(tool=si.Pen.MECHANICAL_PENCIL_2, color=si.PenColor.BLACK,
+                              base_width=7, base_pressure=160, thickness_scale=1.0),
+    "paintbrush": dict(tool=si.Pen.PAINTBRUSH_2, color=si.PenColor.BLACK,
+                       base_width=12, base_pressure=170, thickness_scale=1.5),
+    "calligraphy": dict(tool=si.Pen.CALIGRAPHY, color=si.PenColor.BLACK,
+                        base_width=12, base_pressure=180, thickness_scale=1.5),
+    # Highlighter is for emphasis, not writing prose; even tuned down it's chunky.
+    "highlighter": dict(tool=si.Pen.HIGHLIGHTER_2, color=si.PenColor.HIGHLIGHT,
+                        base_width=16, base_pressure=180, thickness_scale=2.0),
+}
+DEFAULT_PEN = "fineliner"
+
 
 def _hershey_line_segments(line_text: str, font: str):
     """Single-line glyph segments for one line of text, via Hershey-Fonts."""
@@ -217,9 +242,42 @@ def lines_to_rm_bytes(lines: List[si.Line], *, version: str = "3.2.2") -> bytes:
     return buf.getvalue()
 
 
-def text_to_rm_bytes(text: str, *, tool: si.Pen = si.Pen.FINELINER_2, **kw) -> bytes:
-    """Convenience: text -> hand-drawn v6 .rm page bytes."""
-    strokes = text_to_strokes(text, **{k: v for k, v in kw.items() if k in {
-        "font", "scale", "line_spacing", "max_chars", "jitter", "slant", "seed"}})
-    lines = strokes_to_lines(strokes, tool=tool)
+_LAYOUT_KW = {"font", "scale", "line_spacing", "max_chars", "jitter", "slant", "seed"}
+
+
+def text_to_rm_bytes(text: str, *, pen: str = DEFAULT_PEN, **kw) -> bytes:
+    """text -> hand-drawn v6 .rm page bytes, drawn with a named pen from PEN_PRESETS.
+
+    Extra kwargs are layout options for text_to_strokes (font, scale, ...).
+    """
+    if pen not in PEN_PRESETS:
+        raise ValueError(f"unknown pen {pen!r}; choices: {sorted(PEN_PRESETS)}")
+    preset = PEN_PRESETS[pen]
+    strokes = text_to_strokes(text, **{k: v for k, v in kw.items() if k in _LAYOUT_KW})
+    lines = strokes_to_lines(
+        strokes,
+        tool=preset["tool"],
+        color=preset["color"],
+        base_width=preset["base_width"],
+        base_pressure=preset["base_pressure"],
+        thickness_scale=preset["thickness_scale"],
+    )
     return lines_to_rm_bytes(lines)
+
+
+def pen_sample_pages(
+    pens=None,
+    *,
+    sample: str = "The quick brown fox jumps over the lazy dog. 0123456789",
+    font: str = "cursive",
+) -> List[bytes]:
+    """One .rm page per pen (label + sample line in that pen) for an on-device survey.
+
+    Returns a list of page byte-strings; pass to SSHClient.create_rm_notebook so the
+    whole survey is a single multi-page notebook (one xochitl restart).
+    """
+    pens = list(pens) if pens else list(PEN_PRESETS)
+    pages: List[bytes] = []
+    for name in pens:
+        pages.append(text_to_rm_bytes(f"{name}\n{sample}", pen=name, font=font, scale=2.6))
+    return pages

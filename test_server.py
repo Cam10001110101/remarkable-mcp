@@ -2534,3 +2534,40 @@ class TestSSHMetadataFraming:
             "create_folder produced a cloud-archived folder; browse/read/recent "
             "will hide it. Newly created on-device items must not be synced=False."
         )
+
+
+class TestHandwritingPalette:
+    """The 1:1 pen palette and the on-device pen-survey page generator."""
+
+    def test_pen_presets_map_to_real_pens(self):
+        from rmscene import scene_items as si
+
+        from remarkable_mcp.handwriting import DEFAULT_PEN, PEN_PRESETS
+
+        assert DEFAULT_PEN in PEN_PRESETS
+        for name, preset in PEN_PRESETS.items():
+            assert isinstance(preset["tool"], si.Pen), name
+            assert isinstance(preset["color"], si.PenColor), name
+            assert preset["base_width"] > 0 and preset["base_pressure"] > 0, name
+            assert preset["thickness_scale"] > 0, name
+        # highlighter uses the translucent highlight color
+        assert PEN_PRESETS["highlighter"]["color"] == si.PenColor.HIGHLIGHT
+
+    def test_pen_sample_pages_roundtrip(self):
+        import io
+
+        import pytest
+
+        pytest.importorskip("HersheyFonts")
+        from rmscene import read_blocks
+        from rmscene.scene_stream import SceneLineItemBlock
+
+        from remarkable_mcp.handwriting import pen_sample_pages
+
+        pages = pen_sample_pages(["fineliner", "highlighter"])
+        assert len(pages) == 2
+        for data in pages:
+            strokes = [
+                b for b in read_blocks(io.BytesIO(data)) if isinstance(b, SceneLineItemBlock)
+            ]
+            assert strokes, "sample page has no strokes"

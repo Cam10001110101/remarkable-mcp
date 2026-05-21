@@ -16,18 +16,8 @@ you also render; this script only writes, so SSH env is enough:
 import argparse
 import sys
 
-from rmscene import scene_items as si
-
-from remarkable_mcp.handwriting import text_to_rm_bytes
+from remarkable_mcp.handwriting import PEN_PRESETS, text_to_rm_bytes
 from remarkable_mcp.ssh import create_ssh_client
-
-TOOLS = {
-    "fineliner": si.Pen.FINELINER_2,
-    "ballpoint": si.Pen.BALLPOINT_2,
-    "pencil": si.Pen.PENCIL_2,
-    "marker": si.Pen.MARKER_2,
-    "highlighter": si.Pen.HIGHLIGHTER_2,
-}
 
 
 def main() -> int:
@@ -36,7 +26,7 @@ def main() -> int:
     ap.add_argument("--name", default="Claude (handwritten)", help="document title")
     ap.add_argument("--folder", default=None, help="destination folder name (default: root)")
     ap.add_argument("--font", default="cursive", help="Hershey font (cursive/scripts/futural/...)")
-    ap.add_argument("--tool", default="fineliner", choices=list(TOOLS))
+    ap.add_argument("--tool", default="fineliner", choices=list(PEN_PRESETS))
     args = ap.parse_args()
 
     client = create_ssh_client()
@@ -52,7 +42,7 @@ def main() -> int:
             return 1
         parent_id = match[0].ID
 
-    rm_bytes = text_to_rm_bytes(args.text, font=args.font, tool=TOOLS[args.tool])
+    rm_bytes = text_to_rm_bytes(args.text, pen=args.tool, font=args.font)
     print(f"generated {len(rm_bytes)} .rm bytes ({args.tool}, font={args.font})")
     result = client.create_rm_notebook(args.name, [rm_bytes], parent_id=parent_id)
     print("created native notebook:", result)
