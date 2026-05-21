@@ -4,6 +4,8 @@ This document provides detailed documentation for all MCP tools provided by rema
 
 ## Overview
 
+**Read tools** (available in every mode):
+
 | Tool | Purpose |
 |------|---------|
 | [`remarkable_read`](#remarkable_read) | Read and search document content |
@@ -13,7 +15,18 @@ This document provides detailed documentation for all MCP tools provided by rema
 | [`remarkable_status`](#remarkable_status) | Check connection status |
 | [`remarkable_image`](#remarkable_image) | Get page images (PNG or SVG) |
 
-All tools are **read-only** and return structured JSON with hints for logical next actions.
+**Write tools** (require SSH or USB-web mode — see [Write Tool Parity](#write-tool-parity)):
+
+| Tool | Purpose |
+|------|---------|
+| `remarkable_upload` | Upload a PDF/EPUB/.rmdoc |
+| `remarkable_create_notebook` | Create a blank annotatable document |
+| `remarkable_create_folder` | Create a folder |
+| `remarkable_move` | Move a document or folder |
+| `remarkable_delete` | Move a document/folder to Trash (recoverable) |
+
+Read tools return structured JSON with hints for logical next actions. Cloud mode
+is read-only; write tools are unavailable there.
 
 ## Root Path Filtering
 

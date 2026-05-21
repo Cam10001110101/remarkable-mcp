@@ -59,19 +59,24 @@ class RemarkableMCP(FastMCP):
 def _build_instructions() -> str:
     """Build server instructions based on current configuration."""
     # Check environment
-    ssh_mode = os.environ.get("REMARKABLE_USE_SSH", "").lower() in ("1", "true", "yes")
+    _truthy = ("1", "true", "yes")
+    ssh_mode = os.environ.get("REMARKABLE_USE_SSH", "").lower() in _truthy
+    usb_web_mode = os.environ.get("REMARKABLE_USE_USB_WEB", "").lower() in _truthy
     has_google_vision = bool(os.environ.get("GOOGLE_VISION_API_KEY"))
     ocr_backend = os.environ.get("REMARKABLE_OCR_BACKEND", "auto").lower()
 
     instructions = """# reMarkable MCP Server
 
-Access documents from your reMarkable tablet. All operations are read-only.
+Access documents from your reMarkable tablet. Read tools work in every mode;
+write tools (create/move/delete/upload) require SSH or USB-web mode — see
+"Write Tools" below for which mode each one needs.
 
-## Available Tools
+## Available Tools (read)
 
 - `remarkable_browse(path, query)` - Browse folders or search for documents
 - `remarkable_read(document, content_type, page, grep)` - Read document content with pagination
 - `remarkable_recent(limit)` - Get recently modified documents
+- `remarkable_search(query, ...)` - Search across the library
 - `remarkable_status()` - Check connection and diagnose issues
 - `remarkable_image(document, page, include_ocr)` - Get a PNG image with optional OCR
 
@@ -112,7 +117,8 @@ Documents are registered as resources for direct access:
 - Use resources when you need complete document content without pagination
 """
 
-    # Add SSH-specific instructions
+    # Add mode-specific instructions. Write-tool availability is mode-dependent:
+    # SSH exposes all write tools; USB-web only upload/create_notebook; Cloud none.
     if ssh_mode:
         instructions += """
 ## SSH Mode (Active)
@@ -126,16 +132,41 @@ You're connected directly to the tablet via SSH. This enables:
 - `"text"` (default) - Full content: raw PDF/EPUB text + annotations
 - `"raw"` - Only original PDF/EPUB text (no annotations)
 - `"annotations"` - Only typed text, highlights, and OCR content
+
+### Write Tools (all available in SSH mode)
+- `remarkable_create_folder(name, parent_folder)` - Create a folder
+- `remarkable_create_notebook(name, pages)` - Create a blank annotatable document
+- `remarkable_upload(file_path, dest_folder)` - Upload a PDF/EPUB/.rmdoc
+- `remarkable_move(document, dest_folder)` - Move a document or folder
+- `remarkable_delete(document)` - Move a document/folder to Trash (recoverable)
+
+create_folder/move/delete edit xochitl metadata and briefly restart the tablet
+UI (~5s). delete is reversible — items stay in Trash until the user empties it.
+Confirm intent before deleting.
+"""
+    elif usb_web_mode:
+        instructions += """
+## USB Web Mode (Active)
+
+Connected via the tablet's USB web interface (offline, no subscription).
+
+### Write Tools (USB-web subset)
+- `remarkable_upload(file_path)` - Upload a PDF/EPUB/.rmdoc
+- `remarkable_create_notebook(name, pages)` - Create a blank annotatable document
+
+USB uploads always land in the tablet's "Clippings Import" folder. Moving,
+deleting, and creating folders are NOT available over USB web — the tablet does
+not expose those endpoints. For those, run in SSH mode: `uvx remarkable-mcp --ssh`
 """
     else:
         instructions += """
 ## Cloud Mode (Active)
 
-Connected via reMarkable Cloud API. Some features require SSH mode:
-- Raw PDF/EPUB file downloads
-- `content_type="raw"` parameter
+Connected via reMarkable Cloud API. Some features require SSH or USB-web mode:
+- Raw PDF/EPUB file downloads and `content_type="raw"`
+- All write tools (create/move/delete/upload) — Cloud mode is read-only
 
-For faster access and raw files, consider SSH mode: `uvx remarkable-mcp --ssh`
+For faster access, raw files, and write support, use SSH mode: `uvx remarkable-mcp --ssh`
 """
 
     # Add OCR instructions based on configuration

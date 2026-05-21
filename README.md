@@ -219,6 +219,8 @@ Or copy the `SKILL.md` from this repository into your `~/.openclaw/skills/remark
 
 ## Tools
 
+### Read tools (all modes)
+
 | Tool | Description |
 |------|-------------|
 | `remarkable_read` | Read and extract text from documents (with pagination and search) |
@@ -228,7 +230,20 @@ Or copy the `SKILL.md` from this repository into your `~/.openclaw/skills/remark
 | `remarkable_status` | Check connection status |
 | `remarkable_image` | Get PNG/SVG images of pages (supports OCR via sampling) |
 
-All tools are **read-only** and return structured JSON with hints for next actions.
+### Write tools (SSH or USB-web mode)
+
+| Tool | Description | Modes |
+|------|-------------|-------|
+| `remarkable_upload` | Upload a PDF/EPUB/.rmdoc to the tablet | SSH, USB-web |
+| `remarkable_create_notebook` | Create a blank annotatable document | SSH, USB-web |
+| `remarkable_create_folder` | Create a folder | SSH only |
+| `remarkable_move` | Move a document or folder | SSH only |
+| `remarkable_delete` | Move a document/folder to Trash (recoverable) | SSH only |
+
+Read tools return structured JSON with hints for next actions. Write-tool
+availability depends on connection mode — see the [parity matrix](docs/tools.md#write-tool-parity)
+for which mode exposes each tool and why. Cloud mode is read-only. `remarkable_delete`
+is reversible: items go to the tablet's Trash and stay recoverable until emptied.
 
 📖 **[Full Tools Documentation](docs/tools.md)**
 
