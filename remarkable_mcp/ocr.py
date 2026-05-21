@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_OLLAMA_MODEL = "gemma4:31b"
 DEFAULT_OLLAMA_TIMEOUT = 180
+DEFAULT_OLLAMA_TEMPERATURE = 0.0
 
 _NO_TEXT_SENTINEL = "[NO TEXT DETECTED]"
 
@@ -57,6 +58,21 @@ def get_ollama_timeout() -> int:
         return int(os.environ.get("REMARKABLE_OLLAMA_TIMEOUT", str(DEFAULT_OLLAMA_TIMEOUT)))
     except ValueError:
         return DEFAULT_OLLAMA_TIMEOUT
+
+
+def get_ollama_temperature() -> float:
+    """OCR sampling temperature (env REMARKABLE_OLLAMA_TEMPERATURE, default 0.0).
+
+    0 is correct for OCR/transcription (deterministic). Exposed as a knob because
+    some models behave better at a higher temperature.
+    """
+    raw = os.environ.get("REMARKABLE_OLLAMA_TEMPERATURE")
+    if raw is None:
+        return DEFAULT_OLLAMA_TEMPERATURE
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_OLLAMA_TEMPERATURE
 
 
 def _normalize_host(host: str) -> str:
@@ -105,7 +121,7 @@ def ocr_png_ollama(png: bytes) -> Optional[str]:
                 "prompt": OCR_USER_PROMPT,
                 "images": [image_b64],
                 "stream": False,
-                "options": {"temperature": 0},
+                "options": {"temperature": get_ollama_temperature()},
             },
             timeout=get_ollama_timeout(),
         )
