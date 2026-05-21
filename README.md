@@ -354,9 +354,13 @@ Runs a local vision model (default `gemma4:31b`) for high-quality, fully on-devi
 
 | Env var | Default | Meaning |
 |---------|---------|---------|
-| `REMARKABLE_OLLAMA_MODEL` | `gemma4:31b` | Ollama vision model tag |
-| `REMARKABLE_OLLAMA_HOST` | `OLLAMA_HOST` or `http://localhost:11434` | Ollama server URL |
-| `REMARKABLE_OLLAMA_TIMEOUT` | `180` | Per-page OCR timeout (seconds) |
+| `REMARKABLE_OLLAMA_MODEL` | `gemma4:31b` | Ollama vision model tag (e.g. `qwen3-vl:32b` for faithful handwriting) |
+| `REMARKABLE_OLLAMA_HOST` | `OLLAMA_HOST` or `http://localhost:11434` | Local or remote Ollama URL (bare `host:port` accepted) |
+| `REMARKABLE_OLLAMA_TIMEOUT` | `180` | Per-page OCR timeout (seconds); raise for big models on slow hosts |
+| `REMARKABLE_OLLAMA_TEMPERATURE` | `0` | Sampling temperature (0 = deterministic, best for OCR) |
+
+Swap to a remote host with one line (then reconnect the MCP server):
+`"REMARKABLE_OLLAMA_HOST": "http://192.168.1.50:11434"`.
 
 📖 **[Full Ollama Setup Guide](docs/ollama-setup.md)**
 
