@@ -44,6 +44,14 @@ Examples:
   # SSH with custom host (e.g., using SSH config)
   REMARKABLE_SSH_HOST="remarkable" uvx remarkable-mcp --ssh
 
+  # Serve over HTTP for network access (standalone, always-on endpoint)
+  # Clients connect to http://<host>:8000/mcp instead of spawning a process
+  uvx remarkable-mcp --ssh --http --host 0.0.0.0 --port 8000
+
+HTTP Transport Environment Variables (defaults for --host / --port):
+  REMARKABLE_HTTP_HOST     HTTP bind host (default: 127.0.0.1)
+  REMARKABLE_HTTP_PORT     HTTP port (default: 8000)
+
 USB Web Interface Environment Variables:
   REMARKABLE_USB_HOST      USB web interface host (default: http://10.11.99.1)
   REMARKABLE_USB_TIMEOUT   Request timeout in seconds (default: 10)
@@ -73,6 +81,22 @@ Security Note:
         "--usb",
         action="store_true",
         help="Use USB web interface (connect via USB cable, enable in Storage Settings)",
+    )
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="Serve over HTTP (streamable-http) at /mcp instead of stdio, for network access",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("REMARKABLE_HTTP_HOST", "127.0.0.1"),
+        help="HTTP bind host (default: 127.0.0.1; use 0.0.0.0 for LAN/mesh access)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("REMARKABLE_HTTP_PORT", "8000")),
+        help="HTTP port (default: 8000)",
     )
 
     args = parser.parse_args()
@@ -108,23 +132,17 @@ Security Note:
         except Exception as e:
             print(f"❌ Registration failed: {e}", file=sys.stderr)
             sys.exit(1)
-    elif args.usb:
-        # USB web mode - set environment variable and run server
-        os.environ["REMARKABLE_USE_USB_WEB"] = "1"
-        from remarkable_mcp.server import run
-
-        run()
-    elif args.ssh:
-        # SSH mode - set environment variable and run server
-        os.environ["REMARKABLE_USE_SSH"] = "1"
-        from remarkable_mcp.server import run
-
-        run()
     else:
-        # MCP server mode - only now import the full server
+        # Server mode. Connection mode (cloud / USB web / SSH) is selected via
+        # env vars; transport (stdio / HTTP) is orthogonal and passed to run().
+        if args.usb:
+            os.environ["REMARKABLE_USE_USB_WEB"] = "1"
+        elif args.ssh:
+            os.environ["REMARKABLE_USE_SSH"] = "1"
+
         from remarkable_mcp.server import run
 
-        run()
+        run(http=args.http, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
