@@ -38,6 +38,10 @@ DOCUMENTS_URL = "/documents/"
 DOWNLOAD_URL = "/download/{guid}/rmdoc"
 DOWNLOAD_PDF_URL = "/download/{guid}/pdf"
 THUMBNAIL_URL = "/thumbnail/{guid}"
+UPLOAD_URL = "/upload"
+
+# Uploads can be slower than reads — give them more time by default
+UPLOAD_TIMEOUT = 60
 
 
 @dataclass
@@ -116,12 +120,23 @@ class USBWebClient:
         self._documents_by_id: Dict[str, Document] = {}
 
     def _request(
-        self, endpoint: str, method: str = "GET", timeout: int | None = None
+        self,
+        endpoint: str,
+        method: str = "GET",
+        timeout: int | None = None,
+        files: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
     ) -> requests.Response:
         """Make an HTTP request to the USB web interface."""
         url = f"{self.host}{endpoint}"
         try:
-            response = requests.request(method, url, timeout=timeout or self.timeout)
+            response = requests.request(
+                method,
+                url,
+                timeout=timeout or self.timeout,
+                files=files,
+                data=data,
+            )
             response.raise_for_status()
             return response
         except requests.Timeout:
@@ -232,6 +247,11 @@ class USBWebClient:
                     break
 
             except Exception as e:
+                # If the root request fails, the tablet is unreachable — propagate
+                # rather than silently returning an empty library, which would lie
+                # to callers like remarkable_status().
+                if url == DOCUMENTS_URL:
+                    raise
                 logger.warning(f"Failed to fetch documents from {url}: {e}")
                 continue
 
@@ -329,6 +349,89 @@ class USBWebClient:
             self.get_meta_items()
 
         return {doc_id: self.get_file_type(doc) for doc_id, doc in self._documents_by_id.items()}
+
+    # =========================================================================
+    # Write operations (USB Web Interface only exposes one native write
+    # endpoint: POST /upload. Folder/notebook creation are layered on top by
+    # uploading minimal .rmdoc archives. Move and delete are NOT supported via
+    # the USB web interface — the tablet's xochitl HTTP server does not expose
+    # them — so they are intentionally absent from this client.)
+    # =========================================================================
+
+    def upload(
+        self, file_data: bytes, filename: str, content_type: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Upload a file (PDF, EPUB, or .rmdoc archive) to the tablet.
+
+        Args:
+            file_data: Raw file bytes.
+            filename: Filename including extension. Extension determines
+                handling: ".pdf", ".epub", or ".rmdoc".
+            content_type: Optional MIME type. Inferred from extension if omitted.
+
+        Returns:
+            Parsed JSON response from the tablet (typically the new document's
+            metadata or a status object).
+        """
+        if not content_type:
+            ext = filename.lower().rsplit(".", 1)[-1]
+            content_type = {
+                "pdf": "application/pdf",
+                "epub": "application/epub+zip",
+                "rmdoc": "application/zip",
+            }.get(ext, "application/octet-stream")
+
+        files = {"file": (filename, file_data, content_type)}
+        # Invalidate metadata cache — uploads change the library
+        self._documents = []
+        self._documents_by_id = {}
+        response = self._request(
+            UPLOAD_URL, method="POST", timeout=UPLOAD_TIMEOUT, files=files
+        )
+        try:
+            return response.json()
+        except ValueError:
+            return {"status": "ok", "raw": response.text[:200]}
+
+    def create_notebook(self, name: str, pages: int = 1) -> Dict[str, Any]:
+        """
+        Create a new blank annotatable document on the tablet.
+
+        Generates a blank PDF with the requested page count via PyMuPDF and
+        uploads it as a PDF. The result is annotatable with the pen, behaves
+        like any other PDF, and lands in the tablet's "Clippings Import"
+        folder (the only destination /upload supports — see notes on
+        create_folder).
+
+        Implementation note: we deliberately avoid constructing the binary
+        .rm v6 stroke format (reverse-engineered, varies across firmware).
+        The PDF approach is bullet-proof.
+
+        Args:
+            name: Notebook name as it will appear on the tablet.
+            pages: Number of blank pages (default 1).
+
+        Returns:
+            Dict {"name": ..., "pages": N, "raw": <upload response>}.
+        """
+        try:
+            import fitz  # PyMuPDF
+        except ImportError:
+            raise RuntimeError(
+                "create_notebook requires PyMuPDF (already a project dependency). "
+                "Run: uv sync"
+            )
+
+        # reMarkable native page size in points (1404x1872 px @ 226 dpi → ~497x663pt)
+        pdf = fitz.open()
+        for _ in range(max(1, pages)):
+            pdf.new_page(width=497, height=663)
+        pdf_bytes = pdf.tobytes()
+        pdf.close()
+
+        result = self.upload(pdf_bytes, filename=f"{name}.pdf", content_type="application/pdf")
+        return {"name": name, "pages": pages, "raw": result}
 
 
 def check_usb_web_available(host: str = DEFAULT_USB_HOST) -> bool:
