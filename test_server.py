@@ -1492,6 +1492,43 @@ class TestOcrConfig:
         ocr._reset_ollama_cache()
 
 
+class TestOllamaEngine:
+    """The local Ollama OCR engine."""
+
+    def test_ocr_png_ollama_success(self):
+        from unittest.mock import MagicMock, patch
+
+        from remarkable_mcp import ocr
+
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"response": "hello world\n"}
+        with patch("remarkable_mcp.ocr.requests.post", return_value=resp) as p:
+            out = ocr.ocr_png_ollama(b"PNGDATA")
+        assert out == "hello world"
+        body = p.call_args.kwargs["json"]
+        assert body["model"] == "gemma4:31b"
+        assert body["images"] and isinstance(body["images"][0], str)
+        assert body["stream"] is False
+
+    def test_ocr_png_ollama_no_text_sentinel(self):
+        from unittest.mock import MagicMock, patch
+
+        from remarkable_mcp import ocr
+
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"response": "[NO TEXT DETECTED]"}
+        with patch("remarkable_mcp.ocr.requests.post", return_value=resp):
+            assert ocr.ocr_png_ollama(b"x") is None
+
+    def test_ocr_png_ollama_error_returns_none(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        with patch("remarkable_mcp.ocr.requests.post", side_effect=Exception("refused")):
+            assert ocr.ocr_png_ollama(b"x") is None
+
+
 # =============================================================================
 # Test Tag Support
 # =============================================================================

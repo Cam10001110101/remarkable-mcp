@@ -91,3 +91,29 @@ def should_use_sampling_ocr(ctx: "Context") -> bool:
     if get_ocr_backend() != "sampling":
         return False
     return client_supports_sampling(ctx)
+
+
+def ocr_png_ollama(png: bytes) -> Optional[str]:
+    """OCR a PNG via a local Ollama vision model. Returns None on any failure."""
+    try:
+        image_b64 = base64.b64encode(png).decode("utf-8")
+        resp = requests.post(
+            f"{_normalize_host(get_ollama_host())}/api/generate",
+            json={
+                "model": get_ollama_model(),
+                "system": OCR_SYSTEM_PROMPT,
+                "prompt": OCR_USER_PROMPT,
+                "images": [image_b64],
+                "stream": False,
+                "options": {"temperature": 0},
+            },
+            timeout=get_ollama_timeout(),
+        )
+        if resp.status_code != 200:
+            return None
+        text = (resp.json().get("response") or "").strip()
+        if not text or _NO_TEXT_SENTINEL in text:
+            return None
+        return text
+    except Exception:
+        return None
