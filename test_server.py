@@ -36,6 +36,17 @@ from remarkable_mcp.server import mcp
 # =============================================================================
 
 
+@pytest.fixture(autouse=True)
+def _no_cairo_reexec(monkeypatch):
+    """Stop the macOS cairo/DYLD guard from re-exec'ing the test process.
+
+    cli.main() calls _ensure_macos_cairo_loadable(), which os.execv's the
+    process on macOS when libcairo isn't on DYLD_LIBRARY_PATH. Setting the
+    re-exec sentinel makes the guard a no-op for every test that calls main().
+    """
+    monkeypatch.setenv("REMARKABLE_DYLD_REEXEC", "1")
+
+
 @pytest.fixture
 def mock_document():
     """Create a mock Document object."""
@@ -215,6 +226,86 @@ class TestTransportSelection:
         cli.main()
 
         mock_run.assert_called_once_with(http=True, host="0.0.0.0", port=7777)
+
+
+class TestMacOSCairoGuard:
+    """Test cli._ensure_macos_cairo_loadable (the macOS cairo/DYLD re-exec guard)."""
+
+    def _fake_cairo_dir(self, tmp_path):
+        (tmp_path / "libcairo.2.dylib").write_bytes(b"")
+        return str(tmp_path)
+
+    def test_reexecs_when_cairo_dir_missing_from_dyld_path(self, tmp_path, monkeypatch):
+        """On macOS, when the cairo lib dir isn't on DYLD_LIBRARY_PATH, set it and re-exec."""
+        import remarkable_mcp.cli as cli
+
+        lib_dir = self._fake_cairo_dir(tmp_path)
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.delenv("REMARKABLE_DYLD_REEXEC", raising=False)
+        monkeypatch.setenv("REMARKABLE_CAIRO_LIB_DIR", lib_dir)
+        monkeypatch.delenv("DYLD_LIBRARY_PATH", raising=False)
+
+        captured = {}
+
+        def fake_execv(path, args):
+            captured.update(path=path, args=args)
+
+        monkeypatch.setattr(cli.os, "execv", fake_execv)
+
+        cli._ensure_macos_cairo_loadable()
+
+        assert captured, "expected a re-exec"
+        assert lib_dir in os.environ["DYLD_LIBRARY_PATH"].split(os.pathsep)
+        assert os.environ["REMARKABLE_DYLD_REEXEC"] == "1"
+        assert captured["args"][1:] == [cli.__file__, *sys.argv[1:]]
+
+    def test_no_reexec_when_dir_already_on_dyld_path(self, tmp_path, monkeypatch):
+        """No re-exec when the cairo lib dir is already discoverable."""
+        import remarkable_mcp.cli as cli
+
+        lib_dir = self._fake_cairo_dir(tmp_path)
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.delenv("REMARKABLE_DYLD_REEXEC", raising=False)
+        monkeypatch.setenv("REMARKABLE_CAIRO_LIB_DIR", lib_dir)
+        monkeypatch.setenv("DYLD_LIBRARY_PATH", lib_dir)
+
+        called = []
+        monkeypatch.setattr(cli.os, "execv", lambda *a: called.append(a))
+
+        cli._ensure_macos_cairo_loadable()
+
+        assert not called
+
+    def test_no_reexec_on_non_darwin(self, monkeypatch):
+        """The guard is a no-op off macOS."""
+        import remarkable_mcp.cli as cli
+
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.delenv("REMARKABLE_DYLD_REEXEC", raising=False)
+
+        called = []
+        monkeypatch.setattr(cli.os, "execv", lambda *a: called.append(a))
+
+        cli._ensure_macos_cairo_loadable()
+
+        assert not called
+
+    def test_no_reexec_when_sentinel_already_set(self, tmp_path, monkeypatch):
+        """The sentinel prevents a second re-exec (no exec loop)."""
+        import remarkable_mcp.cli as cli
+
+        lib_dir = self._fake_cairo_dir(tmp_path)
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setenv("REMARKABLE_DYLD_REEXEC", "1")
+        monkeypatch.setenv("REMARKABLE_CAIRO_LIB_DIR", lib_dir)
+        monkeypatch.delenv("DYLD_LIBRARY_PATH", raising=False)
+
+        called = []
+        monkeypatch.setattr(cli.os, "execv", lambda *a: called.append(a))
+
+        cli._ensure_macos_cairo_loadable()
+
+        assert not called
 
 
 # =============================================================================
@@ -436,6 +527,44 @@ class TestRemarkableBrowse:
 
         assert "_error" in data
         assert data["_error"]["type"] == "browse_failed"
+
+    @pytest.mark.asyncio
+    @patch("remarkable_mcp.tools.get_rmapi")
+    async def test_browse_document_path_autoredirects_to_read(self, mock_get_rmapi):
+        """Browsing a document (not folder) path auto-redirects to read.
+
+        Regression test: remarkable_browse is async and must 'await' the
+        internal remarkable_read call. When it was sync and called the async
+        remarkable_read without await, json.loads received a coroutine and
+        raised 'the JSON object must be str, bytes or bytearray, not coroutine'.
+        """
+        import io
+
+        mock_client = Mock()
+        mock_get_rmapi.return_value = mock_client
+
+        doc = Mock()
+        doc.VissibleName = "My PDF"
+        doc.ID = "pdf-123"
+        doc.Parent = ""
+        doc.ModifiedClient = "2024-01-15T10:30:00Z"
+        doc.is_folder = False
+        doc.is_cloud_archived = False
+        doc.tags = []
+        mock_client.get_meta_items.return_value = [doc]
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr("pdf-123.content", '{"fileType": "pdf"}')
+        mock_client.download.return_value = zip_buffer.getvalue()
+
+        with patch("remarkable_mcp.tools.get_file_type", return_value="pdf"):
+            result = await mcp.call_tool("remarkable_browse", {"path": "/My PDF"})
+        data = json.loads(result[0][0].text)
+
+        # The precise regression: browsing a document path must reach the
+        # internal read via 'await', never leak a coroutine into json.loads.
+        assert "coroutine" not in json.dumps(data), f"Got coroutine error: {data}"
 
 
 # =============================================================================
@@ -702,6 +831,57 @@ class TestRemarkableImage:
         compat_schema = image_tool.inputSchema["properties"]["compatibility"]
         assert compat_schema.get("type") == "boolean"
         assert compat_schema.get("default") is False
+
+
+# =============================================================================
+# Test remarkable_search Tool
+# =============================================================================
+
+
+class TestRemarkableSearch:
+    """Test remarkable_search tool."""
+
+    @pytest.mark.asyncio
+    @patch("remarkable_mcp.tools.get_rmapi")
+    async def test_search_returns_content_for_matches(self, mock_get_rmapi):
+        """Search reads each matching document and returns its content.
+
+        Regression test: remarkable_search is async and must 'await' both the
+        internal remarkable_browse and remarkable_read calls. When it was sync
+        and called the async remarkable_read without await, every matched
+        document came back with the error 'the JSON object must be str, bytes
+        or bytearray, not coroutine' and the hint reported 'Found 0 documents'.
+        """
+        import io
+
+        mock_client = Mock()
+        mock_get_rmapi.return_value = mock_client
+
+        doc = Mock()
+        doc.VissibleName = "Searchable Report"
+        doc.ID = "rep-123"
+        doc.Parent = ""
+        doc.ModifiedClient = "2024-01-15T10:30:00Z"
+        doc.is_folder = False
+        doc.is_cloud_archived = False
+        doc.tags = []
+        mock_client.get_meta_items.return_value = [doc]
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr("rep-123.content", '{"fileType": "pdf"}')
+        mock_client.download.return_value = zip_buffer.getvalue()
+
+        with patch("remarkable_mcp.tools.get_file_type", return_value="pdf"):
+            result = await mcp.call_tool("remarkable_search", {"query": "Searchable"})
+        data = json.loads(result[0][0].text)
+
+        # The matched document must be found and read via 'await'. The original
+        # bug surfaced as a per-document "...not coroutine" error and a
+        # "Found 0 documents" hint despite a non-zero count.
+        assert "_error" not in data
+        assert data["count"] == 1
+        assert "coroutine" not in json.dumps(data), f"Got coroutine error: {data}"
 
 
 # =============================================================================
@@ -1106,7 +1286,7 @@ class TestSamplingOCR:
         """Test default OCR backend is auto."""
         import os
 
-        from remarkable_mcp.sampling import get_ocr_backend
+        from remarkable_mcp.ocr import get_ocr_backend
 
         # Clear any env var
         env_backup = os.environ.get("REMARKABLE_OCR_BACKEND")
@@ -1124,7 +1304,7 @@ class TestSamplingOCR:
         """Test OCR backend can be set to sampling."""
         import os
 
-        from remarkable_mcp.sampling import get_ocr_backend
+        from remarkable_mcp.ocr import get_ocr_backend
 
         env_backup = os.environ.get("REMARKABLE_OCR_BACKEND")
         os.environ["REMARKABLE_OCR_BACKEND"] = "sampling"
@@ -1144,7 +1324,7 @@ class TestSamplingOCR:
 
         from mcp.types import ClientCapabilities, SamplingCapability
 
-        from remarkable_mcp.sampling import should_use_sampling_ocr
+        from remarkable_mcp.ocr import should_use_sampling_ocr
 
         env_backup = os.environ.get("REMARKABLE_OCR_BACKEND")
         if "REMARKABLE_OCR_BACKEND" in os.environ:
@@ -1171,7 +1351,7 @@ class TestSamplingOCR:
 
         from mcp.types import ClientCapabilities, SamplingCapability
 
-        from remarkable_mcp.sampling import should_use_sampling_ocr
+        from remarkable_mcp.ocr import should_use_sampling_ocr
 
         env_backup = os.environ.get("REMARKABLE_OCR_BACKEND")
         os.environ["REMARKABLE_OCR_BACKEND"] = "sampling"
@@ -1198,7 +1378,7 @@ class TestSamplingOCR:
 
         from mcp.types import ClientCapabilities
 
-        from remarkable_mcp.sampling import should_use_sampling_ocr
+        from remarkable_mcp.ocr import should_use_sampling_ocr
 
         env_backup = os.environ.get("REMARKABLE_OCR_BACKEND")
         os.environ["REMARKABLE_OCR_BACKEND"] = "sampling"
@@ -1246,13 +1426,12 @@ class TestSamplingOCR:
 
     def test_sampling_imports_from_module(self):
         """Test that sampling utilities can be imported."""
+        from remarkable_mcp.ocr import get_ocr_backend, should_use_sampling_ocr
         from remarkable_mcp.sampling import (
             OCR_SYSTEM_PROMPT,
             OCR_USER_PROMPT,
-            get_ocr_backend,
             ocr_pages_via_sampling,
             ocr_via_sampling,
-            should_use_sampling_ocr,
         )
 
         # Verify all functions/constants are accessible
@@ -1262,6 +1441,306 @@ class TestSamplingOCR:
         assert callable(should_use_sampling_ocr)
         assert isinstance(OCR_SYSTEM_PROMPT, str)
         assert isinstance(OCR_USER_PROMPT, str)
+
+
+class TestOcrConfig:
+    """Config + reachability for the unified OCR module."""
+
+    def test_get_ocr_backend_default_and_env(self):
+        import os
+
+        from remarkable_mcp.ocr import get_ocr_backend
+
+        os.environ.pop("REMARKABLE_OCR_BACKEND", None)
+        try:
+            assert get_ocr_backend() == "auto"
+            os.environ["REMARKABLE_OCR_BACKEND"] = "OLLAMA"
+            assert get_ocr_backend() == "ollama"
+        finally:
+            os.environ.pop("REMARKABLE_OCR_BACKEND", None)
+
+    def test_ollama_config_defaults(self):
+        import os
+
+        from remarkable_mcp import ocr
+
+        for k in (
+            "REMARKABLE_OLLAMA_MODEL",
+            "REMARKABLE_OLLAMA_HOST",
+            "OLLAMA_HOST",
+            "REMARKABLE_OLLAMA_TIMEOUT",
+        ):
+            os.environ.pop(k, None)
+        assert ocr.get_ollama_model() == "gemma4:31b"
+        assert ocr.get_ollama_host() == "http://localhost:11434"
+        assert ocr.get_ollama_timeout() == 180
+
+    def test_ollama_available_true_false_and_cache(self):
+        from unittest.mock import MagicMock, patch
+
+        from remarkable_mcp import ocr
+
+        ocr._reset_ollama_cache()
+        with patch("remarkable_mcp.ocr.requests.get") as g:
+            g.return_value = MagicMock(status_code=200)
+            assert ocr.ollama_available() is True
+            assert ocr.ollama_available() is True  # cached, no second call
+            assert g.call_count == 1
+        ocr._reset_ollama_cache()
+        with patch("remarkable_mcp.ocr.requests.get", side_effect=Exception("refused")):
+            assert ocr.ollama_available() is False
+        ocr._reset_ollama_cache()
+
+    def test_normalize_host(self):
+        from remarkable_mcp import ocr
+
+        assert ocr._normalize_host("127.0.0.1:11434") == "http://127.0.0.1:11434"
+        assert ocr._normalize_host("http://h:1/") == "http://h:1"
+        assert ocr._normalize_host("https://x") == "https://x"
+
+
+class TestOllamaEngine:
+    """The local Ollama OCR engine."""
+
+    def test_ocr_png_ollama_success(self):
+        from unittest.mock import MagicMock, patch
+
+        from remarkable_mcp import ocr
+
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"response": "hello world\n"}
+        with patch("remarkable_mcp.ocr.requests.post", return_value=resp) as p:
+            out = ocr.ocr_png_ollama(b"PNGDATA")
+        assert out == "hello world"
+        body = p.call_args.kwargs["json"]
+        assert body["model"] == "gemma4:31b"
+        assert body["images"] and isinstance(body["images"][0], str)
+        assert body["stream"] is False
+
+    def test_ocr_png_ollama_no_text_sentinel(self):
+        from unittest.mock import MagicMock, patch
+
+        from remarkable_mcp import ocr
+
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"response": "[NO TEXT DETECTED]"}
+        with patch("remarkable_mcp.ocr.requests.post", return_value=resp):
+            assert ocr.ocr_png_ollama(b"x") is None
+
+    def test_ocr_png_ollama_error_returns_none(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        with patch("remarkable_mcp.ocr.requests.post", side_effect=Exception("refused")):
+            assert ocr.ocr_png_ollama(b"x") is None
+
+
+class TestPngEngines:
+    """PNG-bytes tesseract + google engines living in ocr.py."""
+
+    def test_ocr_png_google_no_key_returns_none(self):
+        import os
+
+        from remarkable_mcp import ocr
+
+        os.environ.pop("GOOGLE_VISION_API_KEY", None)
+        assert ocr.ocr_png_google(b"x") is None
+
+    def test_ocr_png_google_success(self):
+        import os
+        from unittest.mock import MagicMock, patch
+
+        from remarkable_mcp import ocr
+
+        os.environ["GOOGLE_VISION_API_KEY"] = "k"
+        try:
+            resp = MagicMock(status_code=200)
+            resp.json.return_value = {
+                "responses": [{"fullTextAnnotation": {"text": "G text"}}]
+            }
+            with patch("remarkable_mcp.ocr.requests.post", return_value=resp):
+                assert ocr.ocr_png_google(b"x") == "G text"
+        finally:
+            os.environ.pop("GOOGLE_VISION_API_KEY", None)
+
+    def test_ocr_png_tesseract_missing_dep_returns_none(self):
+        import builtins
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *a, **k):
+            if name == "pytesseract":
+                raise ImportError("no tesseract")
+            return real_import(name, *a, **k)
+
+        with patch("builtins.__import__", side_effect=fake_import):
+            assert ocr.ocr_png_tesseract(b"x") is None
+
+    def test_ocr_png_google_no_key_delegates_to_sdk(self):
+        import os
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        os.environ.pop("GOOGLE_VISION_API_KEY", None)
+        with patch("remarkable_mcp.ocr._ocr_png_google_sdk", return_value="SDK text"):
+            assert ocr.ocr_png_google(b"x") == "SDK text"
+
+    def test_ocr_png_google_sdk_returns_none_without_library(self):
+        from remarkable_mcp import ocr
+
+        # google-cloud-vision is an optional dep; absent (or uncredentialed) -> None.
+        assert ocr._ocr_png_google_sdk(b"x") is None
+
+    def test_ocr_png_google_empty_response_returns_none(self):
+        import os
+        from unittest.mock import MagicMock, patch
+
+        from remarkable_mcp import ocr
+
+        os.environ["GOOGLE_VISION_API_KEY"] = "k"
+        try:
+            resp = MagicMock(status_code=200)
+            resp.json.return_value = {"responses": [{}]}
+            with patch("remarkable_mcp.ocr.requests.post", return_value=resp):
+                assert ocr.ocr_png_google(b"x") is None
+        finally:
+            os.environ.pop("GOOGLE_VISION_API_KEY", None)
+
+
+class TestOcrDispatcher:
+    """Backend resolution + sync/async dispatch."""
+
+    def setup_method(self):
+        import os
+
+        from remarkable_mcp import ocr
+
+        for k in ("REMARKABLE_OCR_BACKEND", "GOOGLE_VISION_API_KEY"):
+            os.environ.pop(k, None)
+        ocr._reset_ollama_cache()
+
+    def test_resolve_page_engine_auto_prefers_ollama_when_reachable(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        with patch("remarkable_mcp.ocr.ollama_available", return_value=True):
+            assert ocr.resolve_page_ocr_engine(ctx=None) == "ollama"
+        with patch("remarkable_mcp.ocr.ollama_available", return_value=False):
+            assert ocr.resolve_page_ocr_engine(ctx=None) is None
+
+    def test_sync_dispatch_auto_ollama_then_fallback(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        with patch("remarkable_mcp.ocr.ollama_available", return_value=True), patch(
+            "remarkable_mcp.ocr.ocr_png_ollama", return_value=None
+        ), patch("remarkable_mcp.ocr.ocr_png_google", return_value=None), patch(
+            "remarkable_mcp.ocr.ocr_png_tesseract", return_value="T"
+        ):
+            text, backend = ocr.ocr_png_sync(b"x")
+        assert (text, backend) == ("T", "tesseract")
+
+    def test_sync_dispatch_auto_ollama_wins(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        with patch("remarkable_mcp.ocr.ollama_available", return_value=True), patch(
+            "remarkable_mcp.ocr.ocr_png_ollama", return_value="O"
+        ):
+            assert ocr.ocr_png_sync(b"x") == ("O", "ollama")
+
+    def test_sync_dispatch_no_ollama_uses_tesseract(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        with patch("remarkable_mcp.ocr.ollama_available", return_value=False), patch(
+            "remarkable_mcp.ocr.ocr_png_tesseract", return_value="T"
+        ):
+            assert ocr.ocr_png_sync(b"x") == ("T", "tesseract")
+
+    @pytest.mark.asyncio
+    async def test_async_dispatch_auto_ollama(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        with patch("remarkable_mcp.ocr.ollama_available", return_value=True), patch(
+            "remarkable_mcp.ocr.ocr_png_ollama", return_value="O"
+        ):
+            assert await ocr.ocr_png(b"x", ctx=None) == ("O", "ollama")
+
+    def test_sync_dispatch_explicit_ollama_chain(self):
+        import os
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        os.environ["REMARKABLE_OCR_BACKEND"] = "ollama"
+        try:
+            with patch("remarkable_mcp.ocr.ocr_png_ollama", return_value=None), patch(
+                "remarkable_mcp.ocr.ocr_png_google", return_value=None
+            ), patch("remarkable_mcp.ocr.ocr_png_tesseract", return_value="T"):
+                assert ocr.ocr_png_sync(b"x") == ("T", "tesseract")
+        finally:
+            os.environ.pop("REMARKABLE_OCR_BACKEND", None)
+
+    @pytest.mark.asyncio
+    async def test_async_dispatch_sampling_first(self):
+        import os
+        from unittest.mock import AsyncMock, patch
+
+        from remarkable_mcp import ocr
+
+        os.environ["REMARKABLE_OCR_BACKEND"] = "sampling"
+        try:
+            with patch(
+                "remarkable_mcp.ocr.client_supports_sampling", return_value=True
+            ), patch(
+                "remarkable_mcp.ocr.ocr_png_sampling", new=AsyncMock(return_value="S")
+            ):
+                assert await ocr.ocr_png(b"x", ctx=object()) == ("S", "sampling")
+        finally:
+            os.environ.pop("REMARKABLE_OCR_BACKEND", None)
+
+
+class TestExtractHandwritingDelegation:
+    """extract_handwriting_ocr renders pages then delegates to ocr.ocr_png_sync."""
+
+    def test_extract_handwriting_delegates_to_ocr(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp.extract import extract_handwriting_ocr
+
+        rm_files = ["/tmp/p1.rm", "/tmp/p2.rm"]
+        with patch(
+            "remarkable_mcp.extract.render_rm_file_to_png", return_value=b"PNG"
+        ), patch(
+            "remarkable_mcp.ocr.ocr_png_sync",
+            side_effect=[("page one", "ollama"), ("page two", "ollama")],
+        ):
+            results, backend = extract_handwriting_ocr(rm_files)
+        assert results == ["page one", "page two"]
+        assert backend == "ollama"
+
+    def test_extract_handwriting_skips_unrenderable_pages(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp.extract import extract_handwriting_ocr
+
+        with patch(
+            "remarkable_mcp.extract.render_rm_file_to_png", return_value=None
+        ), patch("remarkable_mcp.ocr.ocr_png_sync", return_value=("x", "tesseract")):
+            results, backend = extract_handwriting_ocr(["/tmp/p1.rm"])
+        assert results is None and backend is None
 
 
 # =============================================================================

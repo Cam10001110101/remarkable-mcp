@@ -324,6 +324,7 @@ For handwritten content, remarkable-mcp offers several OCR backends. Choose base
 
 | Backend | Setup | Quality | Offline | Best For |
 |---------|-------|---------|---------|----------|
+| **Ollama (Gemma)** | `ollama pull gemma4:31b` | Excellent | ✅ | Local, private, no API key — **recommended** |
 | **Sampling** | No API key | Depends on client model | ✅ | Users with capable AI clients |
 | **Google Vision** | API key | Excellent | ❌ | Best handwriting accuracy |
 | **Tesseract** | System install | Poor for handwriting | ✅ | Printed text, offline fallback |
@@ -340,7 +341,26 @@ Set `REMARKABLE_OCR_BACKEND` in your MCP config:
 }
 ```
 
-**Options:** `sampling`, `google`, `tesseract`, `auto`
+**Options:** `ollama`, `sampling`, `google`, `tesseract`, `auto`
+
+<details>
+<summary>📖 Ollama / Gemma (Local, Recommended)</summary>
+
+Runs a local vision model (default `gemma4:31b`) for high-quality, fully on-device handwriting OCR — no API key, nothing leaves your machine.
+
+**Setup:**
+1. Install [Ollama](https://ollama.com) and pull a vision model: `ollama pull gemma4:31b` (or `gemma4:e4b` for lower latency/RAM).
+2. With `REMARKABLE_OCR_BACKEND=auto` (the default), the server detects the running Ollama server and uses it automatically.
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `REMARKABLE_OLLAMA_MODEL` | `gemma4:31b` | Ollama vision model tag |
+| `REMARKABLE_OLLAMA_HOST` | `OLLAMA_HOST` or `http://localhost:11434` | Ollama server URL |
+| `REMARKABLE_OLLAMA_TIMEOUT` | `180` | Per-page OCR timeout (seconds) |
+
+📖 **[Full Ollama Setup Guide](docs/ollama-setup.md)**
+
+</details>
 
 <details>
 <summary>📖 Sampling OCR (No API Key)</summary>
@@ -396,8 +416,9 @@ choco install tesseract
 ### Default Behavior (`auto`)
 
 When `REMARKABLE_OCR_BACKEND=auto` (default):
-1. Google Vision (if `GOOGLE_VISION_API_KEY` is set)
-2. Tesseract (fallback)
+1. **Ollama** (if a local Ollama server is reachable) — see [Ollama setup](docs/ollama-setup.md)
+2. Google Vision (if `GOOGLE_VISION_API_KEY` is set)
+3. Tesseract (fallback)
 
 ---
 

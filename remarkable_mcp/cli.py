@@ -14,13 +14,62 @@ Usage:
 """
 
 import argparse
+import glob
 import json
 import os
 import sys
 
 
+def _ensure_macos_cairo_loadable() -> None:
+    """Make libcairo discoverable on macOS before cairosvg is imported.
+
+    ``remarkable_image`` renders pages with cairosvg, which dlopen()s libcairo
+    at runtime. On macOS, Homebrew installs libcairo under /opt/homebrew/lib
+    (Apple Silicon) or /usr/local/lib (Intel) -- neither is on dyld's default
+    search path. Setting DYLD_LIBRARY_PATH fixes it, but launchers like the
+    1Password ``op`` CLI are hardened binaries, and macOS strips DYLD_* from the
+    environment when they exec a child -- so a DYLD_LIBRARY_PATH set in mcp.json
+    never reaches us. Detect that, set the path ourselves, and re-exec once so
+    dyld picks it up at launch (DYLD_* is only read when the process starts).
+
+    Set REMARKABLE_CAIRO_LIB_DIR to override the library directory.
+    """
+    if sys.platform != "darwin":
+        return
+    # Re-exec only once -- guard against an exec loop.
+    if os.environ.get("REMARKABLE_DYLD_REEXEC") == "1":
+        return
+
+    candidates = []
+    override = os.environ.get("REMARKABLE_CAIRO_LIB_DIR")
+    if override:
+        candidates.append(override)
+    candidates += ["/opt/homebrew/lib", "/usr/local/lib"]
+
+    lib_dir = next(
+        (d for d in candidates if glob.glob(os.path.join(d, "libcairo*.dylib"))),
+        None,
+    )
+    if lib_dir is None:
+        # Homebrew cairo isn't installed where we expect; nothing to do. The
+        # image tool will surface a clear error if cairosvg can't load.
+        return
+
+    existing = os.environ.get("DYLD_LIBRARY_PATH", "")
+    if lib_dir in existing.split(os.pathsep):
+        # Already discoverable (e.g. launched without a hardened wrapper).
+        return
+
+    os.environ["DYLD_LIBRARY_PATH"] = os.pathsep.join(p for p in (lib_dir, existing) if p)
+    os.environ["REMARKABLE_DYLD_REEXEC"] = "1"
+    # execv replaces this process image, preserving the stdio fds the MCP client
+    # is connected to, and inherits the env we just set.
+    os.execv(sys.executable, [sys.executable, __file__, *sys.argv[1:]])
+
+
 def main():
     """Main entry point - handle CLI args or run MCP server."""
+    _ensure_macos_cairo_loadable()
     parser = argparse.ArgumentParser(
         description="reMarkable MCP Server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
