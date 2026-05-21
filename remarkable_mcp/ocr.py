@@ -117,3 +117,57 @@ def ocr_png_ollama(png: bytes) -> Optional[str]:
         return text
     except Exception:
         return None
+
+
+def ocr_png_tesseract(png: bytes) -> Optional[str]:
+    """Local Tesseract OCR on PNG bytes (weak on handwriting; last-resort fallback)."""
+    try:
+        import io
+
+        import pytesseract
+        from PIL import Image, ImageFilter, ImageOps
+
+        img = Image.open(io.BytesIO(png)).convert("L")
+        img = ImageOps.autocontrast(img, cutoff=2)
+        img = img.filter(ImageFilter.SHARPEN)
+        text = pytesseract.image_to_string(img, config=r"--psm 11 --oem 3")
+        return text.strip() or None
+    except ImportError:
+        return None
+    except Exception:
+        return None
+
+
+def ocr_png_google(png: bytes) -> Optional[str]:
+    """Google Cloud Vision REST OCR on PNG bytes. Requires GOOGLE_VISION_API_KEY."""
+    api_key = os.environ.get("GOOGLE_VISION_API_KEY")
+    if not api_key:
+        return None
+    try:
+        image_b64 = base64.b64encode(png).decode("utf-8")
+        resp = requests.post(
+            f"https://vision.googleapis.com/v1/images:annotate?key={api_key}",
+            json={
+                "requests": [
+                    {
+                        "image": {"content": image_b64},
+                        "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+                    }
+                ]
+            },
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            return None
+        responses = resp.json().get("responses") or []
+        if responses and "fullTextAnnotation" in responses[0]:
+            text = responses[0]["fullTextAnnotation"]["text"].strip()
+            return text or None
+        return None
+    except Exception:
+        return None
+
+
+async def ocr_png_sampling(ctx: "Context", png: bytes) -> Optional[str]:
+    """Async wrapper over the MCP-sampling OCR primitive in sampling.py."""
+    return await ocr_via_sampling(ctx, png)

@@ -1529,6 +1529,51 @@ class TestOllamaEngine:
             assert ocr.ocr_png_ollama(b"x") is None
 
 
+class TestPngEngines:
+    """PNG-bytes tesseract + google engines living in ocr.py."""
+
+    def test_ocr_png_google_no_key_returns_none(self):
+        import os
+
+        from remarkable_mcp import ocr
+
+        os.environ.pop("GOOGLE_VISION_API_KEY", None)
+        assert ocr.ocr_png_google(b"x") is None
+
+    def test_ocr_png_google_success(self):
+        import os
+        from unittest.mock import MagicMock, patch
+
+        from remarkable_mcp import ocr
+
+        os.environ["GOOGLE_VISION_API_KEY"] = "k"
+        try:
+            resp = MagicMock(status_code=200)
+            resp.json.return_value = {
+                "responses": [{"fullTextAnnotation": {"text": "G text"}}]
+            }
+            with patch("remarkable_mcp.ocr.requests.post", return_value=resp):
+                assert ocr.ocr_png_google(b"x") == "G text"
+        finally:
+            os.environ.pop("GOOGLE_VISION_API_KEY", None)
+
+    def test_ocr_png_tesseract_missing_dep_returns_none(self):
+        import builtins
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *a, **k):
+            if name == "pytesseract":
+                raise ImportError("no tesseract")
+            return real_import(name, *a, **k)
+
+        with patch("builtins.__import__", side_effect=fake_import):
+            assert ocr.ocr_png_tesseract(b"x") is None
+
+
 # =============================================================================
 # Test Tag Support
 # =============================================================================
