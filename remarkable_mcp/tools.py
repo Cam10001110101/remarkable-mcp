@@ -791,7 +791,7 @@ async def remarkable_read(
 
 
 @mcp.tool(annotations=BROWSE_ANNOTATIONS)
-def remarkable_browse(
+async def remarkable_browse(
     path: str = "/", query: Optional[str] = None, tags: Optional[List[str]] = None
 ) -> str:
     """
@@ -936,7 +936,7 @@ def remarkable_browse(
                                 suggestion="Check REMARKABLE_ROOT_PATH configuration.",
                             )
                         # Call remarkable_read internally and add redirect note
-                        read_result = remarkable_read(_apply_root_filter(doc_path), page=1)
+                        read_result = await remarkable_read(_apply_root_filter(doc_path), page=1)
                         import json
 
                         result_data = json.loads(read_result)
@@ -1148,12 +1148,13 @@ def remarkable_recent(limit: int = 10, include_preview: bool = False) -> str:
 
 
 @mcp.tool(annotations=SEARCH_ANNOTATIONS)
-def remarkable_search(
+async def remarkable_search(
     query: str,
     grep: Optional[str] = None,
     limit: int = 5,
     include_ocr: bool = False,
     tags: Optional[List[str]] = None,
+    ctx: Optional[Context] = None,
 ) -> str:
     """
     <usecase>Search across multiple documents and return matching content.</usecase>
@@ -1191,7 +1192,7 @@ def remarkable_search(
         limit = min(max(1, limit), 5)
 
         # First, find matching documents
-        browse_result = remarkable_browse(query=query, tags=tags)
+        browse_result = await remarkable_browse(query=query, tags=tags)
         browse_data = json.loads(browse_result)
 
         if "_error" in browse_data:
@@ -1220,11 +1221,12 @@ def remarkable_search(
                 doc_result["tags"] = doc["tags"]
 
             try:
-                read_result = remarkable_read(
+                read_result = await remarkable_read(
                     document=doc["path"],
                     page=1,
                     grep=grep,
                     include_ocr=include_ocr,
+                    ctx=ctx,
                 )
                 read_data = json.loads(read_result)
 
