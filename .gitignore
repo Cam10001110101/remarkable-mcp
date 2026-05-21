@@ -75,3 +75,7 @@ Thumbs.db
 *.zip
 RESEARCH_NOTES.md
 BLOG_DRAFT.md
+
+# Local MCP client config (machine-specific paths + 1Password secret refs)
+.mcp.json
+.gemini/

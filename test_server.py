@@ -101,6 +101,11 @@ class TestMCPServerInitialization:
             "remarkable_search",
             "remarkable_status",
             "remarkable_image",
+            "remarkable_upload",
+            "remarkable_create_folder",
+            "remarkable_create_notebook",
+            "remarkable_move",
+            "remarkable_delete",
         ]
 
         for tool_name in expected_tools:
@@ -108,9 +113,9 @@ class TestMCPServerInitialization:
 
     @pytest.mark.asyncio
     async def test_tools_count(self):
-        """Test that we have exactly 6 intent-based tools."""
+        """Test that we have all read + write tools registered."""
         tools = await mcp.list_tools()
-        assert len(tools) == 6, f"Expected 6 tools, got {len(tools)}"
+        assert len(tools) == 11, f"Expected 11 tools, got {len(tools)}"
 
     @pytest.mark.asyncio
     async def test_tool_schemas(self):
@@ -762,7 +767,7 @@ class TestE2E:
         """Test that server can list all tools (e2e)."""
         tools = await mcp.list_tools()
 
-        assert len(tools) == 6
+        assert len(tools) == 11
 
         # Check each tool has required properties and starts with remarkable_
         for tool in tools:
@@ -1482,6 +1487,19 @@ class TestUSBWebInterface:
         assert client.get_file_type(pdf_doc) == "pdf"
 
     @patch("requests.request")
+    def test_usb_web_get_meta_items_root_unreachable_raises(self, mock_request):
+        """Root /documents/ failure must raise, not return an empty list silently."""
+        import requests
+
+        from remarkable_mcp.usb_web import USBWebClient
+
+        mock_request.side_effect = requests.ConnectionError("Connection refused")
+
+        client = USBWebClient()
+        with pytest.raises(RuntimeError, match="Cannot connect"):
+            client.get_meta_items()
+
+    @patch("requests.request")
     def test_usb_web_download(self, mock_request):
         """Test downloading document via USB web interface."""
         from remarkable_mcp.usb_web import Document, USBWebClient
@@ -1578,6 +1596,198 @@ class TestUSBWebInterface:
             if "REMARKABLE_USE_USB_WEB" in os.environ:
                 del os.environ["REMARKABLE_USE_USB_WEB"]
             # Reload to reset
+            if "remarkable_mcp.api" in sys.modules:
+                import importlib
+
+                import remarkable_mcp.api
+
+                importlib.reload(remarkable_mcp.api)
+
+
+# =============================================================================
+# Test write tools (upload, create_folder, create_notebook, move, delete)
+# =============================================================================
+
+
+class TestUSBWebWriteOperations:
+    """Test the USBWebClient write methods against a mocked HTTP layer."""
+
+    @patch("requests.request")
+    def test_upload_posts_multipart_with_file_field(self, mock_request):
+        from remarkable_mcp.usb_web import USBWebClient
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"status": "ok"}
+        mock_request.return_value = mock_response
+
+        client = USBWebClient()
+        client.upload(b"%PDF-1.4 hello", filename="test.pdf")
+
+        # Verify the request was a POST to /upload with multipart 'file' field
+        call = mock_request.call_args
+        assert call.args[0] == "POST"
+        assert call.args[1].endswith("/upload")
+        files = call.kwargs["files"]
+        assert "file" in files
+        assert files["file"][0] == "test.pdf"
+        assert files["file"][1] == b"%PDF-1.4 hello"
+        assert files["file"][2] == "application/pdf"
+
+    @patch("requests.request")
+    def test_create_notebook_uploads_pdf_with_requested_page_count(self, mock_request):
+        from remarkable_mcp.usb_web import USBWebClient
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"status": "Upload successful"}
+        mock_request.return_value = mock_response
+
+        client = USBWebClient()
+        result = client.create_notebook("Notes", pages=3)
+
+        assert result["name"] == "Notes"
+        assert result["pages"] == 3
+        # Verify a PDF was uploaded
+        call = mock_request.call_args
+        files = call.kwargs["files"]
+        assert files["file"][0] == "Notes.pdf"
+        assert files["file"][1].startswith(b"%PDF")
+        # Confirm the PDF has 3 pages
+        import fitz
+
+        doc = fitz.open(stream=files["file"][1], filetype="pdf")
+        assert doc.page_count == 3
+        doc.close()
+
+
+class TestSSHWriteOperations:
+    """Test the SSHClient write methods (delete + move) with mocked SSH."""
+
+    def test_delete_marks_metadata_and_restarts_xochitl(self):
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient()
+        # First call: cat metadata (read). Second: write back. Third: restart.
+        with patch.object(client, "_ssh_command") as mock_cmd:
+            mock_cmd.side_effect = [
+                json.dumps({"deleted": False, "type": "DocumentType", "parent": ""}),
+                "",  # write
+                "",  # restart
+            ]
+            result = client.delete("doc-uuid-1")
+
+        assert result["deleted"] is True
+        assert result["transport"] == "ssh"
+        # The write call should include base64-encoded metadata with deleted:true
+        write_cmd = mock_cmd.call_args_list[1].args[0]
+        # base64 segment in the cmd should decode to JSON with deleted:true
+        import base64 as _b64
+        import re
+
+        # shlex.quote may or may not wrap the base64 in quotes depending on chars.
+        match = re.search(r"echo '?([A-Za-z0-9+/=]+)'? \| base64 -d", write_cmd)
+        assert match, f"Could not find base64 payload in: {write_cmd[:200]}"
+        encoded = match.group(1)
+        decoded = json.loads(_b64.b64decode(encoded).decode())
+        assert decoded["deleted"] is True
+        assert decoded["metadatamodified"] is True
+
+        # Third call should be the systemctl restart
+        assert "systemctl restart xochitl" in mock_cmd.call_args_list[2].args[0]
+
+    def test_create_folder_writes_collectiontype_metadata(self):
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient()
+        with patch.object(client, "_ssh_command") as mock_cmd:
+            mock_cmd.side_effect = ["", ""]  # write + restart
+            result = client.create_folder("Reading", parent_id="parent-uuid")
+
+        assert result["name"] == "Reading"
+        assert result["parent"] == "parent-uuid"
+        assert result["transport"] == "ssh"
+
+        write_cmd = mock_cmd.call_args_list[0].args[0]
+        import base64 as _b64
+        import re
+
+        match = re.search(r"echo '?([A-Za-z0-9+/=]+)'? \| base64 -d", write_cmd)
+        assert match
+        decoded = json.loads(_b64.b64decode(match.group(1)).decode())
+        assert decoded["type"] == "CollectionType"
+        assert decoded["visibleName"] == "Reading"
+        assert decoded["parent"] == "parent-uuid"
+
+    def test_move_updates_parent_and_restarts_xochitl(self):
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient()
+        with patch.object(client, "_ssh_command") as mock_cmd:
+            mock_cmd.side_effect = [
+                json.dumps({"deleted": False, "type": "DocumentType", "parent": "old"}),
+                "",
+                "",
+            ]
+            result = client.move("doc-uuid-2", "new-parent-uuid")
+
+        assert result["parent"] == "new-parent-uuid"
+        write_cmd = mock_cmd.call_args_list[1].args[0]
+        import base64 as _b64
+        import re
+
+        # shlex.quote may or may not wrap the base64 in quotes depending on chars.
+        match = re.search(r"echo '?([A-Za-z0-9+/=]+)'? \| base64 -d", write_cmd)
+        assert match, f"Could not find base64 payload in: {write_cmd[:200]}"
+        encoded = match.group(1)
+        decoded = json.loads(_b64.b64decode(encoded).decode())
+        assert decoded["parent"] == "new-parent-uuid"
+
+
+class TestWriteToolGuards:
+    """Test that write tools refuse to run in the wrong transport mode."""
+
+    @pytest.mark.asyncio
+    async def test_upload_refuses_when_not_usb_web(self):
+        import os
+        import sys
+
+        # Force cloud mode (the default when neither flag is set)
+        for var in ("REMARKABLE_USE_USB_WEB", "REMARKABLE_USE_SSH"):
+            os.environ.pop(var, None)
+        if "remarkable_mcp.api" in sys.modules:
+            import importlib
+
+            import remarkable_mcp.api
+
+            importlib.reload(remarkable_mcp.api)
+
+        result = await mcp.call_tool("remarkable_upload", {"file_path": "/tmp/x.pdf"})
+        data = json.loads(result[0][0].text)
+        assert "_error" in data
+        assert "USB web" in str(data)
+
+    @pytest.mark.asyncio
+    async def test_delete_refuses_when_not_ssh(self):
+        import os
+        import sys
+
+        os.environ["REMARKABLE_USE_USB_WEB"] = "1"
+        os.environ.pop("REMARKABLE_USE_SSH", None)
+        if "remarkable_mcp.api" in sys.modules:
+            import importlib
+
+            import remarkable_mcp.api
+
+            importlib.reload(remarkable_mcp.api)
+
+        try:
+            result = await mcp.call_tool("remarkable_delete", {"document": "anything"})
+            data = json.loads(result[0][0].text)
+            assert "_error" in data
+            assert "SSH" in str(data)
+        finally:
+            os.environ.pop("REMARKABLE_USE_USB_WEB", None)
             if "remarkable_mcp.api" in sys.modules:
                 import importlib
 

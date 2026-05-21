@@ -17,7 +17,9 @@ import io
 import json
 import logging
 import os
+import shlex
 import subprocess
+import time
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -399,6 +401,137 @@ class SSHClient:
             return data.get("fileType")
         except Exception:
             return None
+
+    # =========================================================================
+    # Write operations (delete + move) — SSH-only.
+    # The reMarkable tablet's USB Web Interface does not expose move or delete
+    # endpoints, so these are implemented by editing .metadata files directly
+    # on the tablet's filesystem and restarting xochitl to pick up the change.
+    # =========================================================================
+
+    def create_folder(self, name: str, parent_id: str = "") -> Dict[str, Any]:
+        """
+        Create a new folder on the tablet via SSH.
+
+        Writes a {uuid}.metadata file directly to xochitl's storage directory
+        and restarts xochitl. This is the only way to create real folders on
+        the device — the USB Web Interface does not expose a folder endpoint.
+
+        Args:
+            name: Folder name as it will appear on the tablet.
+            parent_id: Parent folder UUID. Empty string places at root.
+
+        Returns:
+            Dict {"id": <new-uuid>, "name": ..., "parent": ..., "transport": "ssh"}.
+        """
+        import uuid as _uuid
+
+        folder_id = str(_uuid.uuid4())
+        now_ms = str(int(time.time() * 1000))
+        metadata = {
+            "createdTime": now_ms,
+            "lastModified": now_ms,
+            "lastOpened": now_ms,
+            "lastOpenedPage": 0,
+            "metadatamodified": False,
+            "modified": False,
+            "new": True,
+            "parent": parent_id,
+            "pinned": False,
+            "synced": False,
+            "type": "CollectionType",
+            "version": 0,
+            "visibleName": name,
+        }
+        self._write_metadata(folder_id, metadata)
+        self._restart_xochitl()
+        self._documents = []
+        self._documents_by_id = {}
+        return {
+            "id": folder_id,
+            "name": name,
+            "parent": parent_id,
+            "transport": "ssh",
+        }
+
+    def _read_metadata(self, doc_id: str) -> Dict[str, Any]:
+        """Read a document's .metadata JSON from the tablet."""
+        path = f"{XOCHITL_PATH}/{doc_id}.metadata"
+        raw = self._ssh_command(f"cat {shlex.quote(path)}", timeout=15)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Could not parse metadata for {doc_id}: {e}")
+
+    def _write_metadata(self, doc_id: str, metadata: Dict[str, Any]) -> None:
+        """Atomically write a document's .metadata JSON back to the tablet."""
+        path = f"{XOCHITL_PATH}/{doc_id}.metadata"
+        # Write via a tempfile + mv so xochitl never sees a half-written file.
+        tmp_path = f"{path}.tmp"
+        payload = json.dumps(metadata, indent=4)
+        # base64-encode to avoid quoting/escaping nightmares with arbitrary names
+        import base64
+
+        encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        cmd = (
+            f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(tmp_path)} "
+            f"&& mv {shlex.quote(tmp_path)} {shlex.quote(path)}"
+        )
+        self._ssh_command(cmd, timeout=15)
+
+    def _restart_xochitl(self) -> None:
+        """Restart xochitl so it picks up filesystem-level metadata changes."""
+        # xochitl is a systemd service; restart is brief (a few seconds of black
+        # screen) but unavoidable — xochitl caches metadata in memory.
+        self._ssh_command("systemctl restart xochitl", timeout=30)
+
+    def delete(self, doc_id: str) -> Dict[str, Any]:
+        """
+        Mark a document or folder as deleted (moves it to the tablet's trash).
+
+        We set deleted=true in the .metadata rather than rm-ing the files,
+        which is reversible: the user can still recover from the tablet's
+        trash UI until they empty it.
+
+        Args:
+            doc_id: Document UUID.
+
+        Returns:
+            Dict {"id": doc_id, "deleted": True, "transport": "ssh"}.
+        """
+        metadata = self._read_metadata(doc_id)
+        metadata["deleted"] = True
+        metadata["metadatamodified"] = True
+        metadata["lastModified"] = str(int(time.time() * 1000))
+        self._write_metadata(doc_id, metadata)
+        self._restart_xochitl()
+        # Invalidate cache
+        self._documents = []
+        self._documents_by_id = {}
+        return {"id": doc_id, "deleted": True, "transport": "ssh"}
+
+    def move(self, doc_id: str, new_parent_id: str) -> Dict[str, Any]:
+        """
+        Move a document or folder to a new parent.
+
+        Args:
+            doc_id: UUID of the document/folder to move.
+            new_parent_id: UUID of the destination folder. Empty string moves
+                to root.
+
+        Returns:
+            Dict {"id": doc_id, "parent": new_parent_id, "transport": "ssh"}.
+        """
+        metadata = self._read_metadata(doc_id)
+        metadata["parent"] = new_parent_id
+        metadata["metadatamodified"] = True
+        metadata["lastModified"] = str(int(time.time() * 1000))
+        self._write_metadata(doc_id, metadata)
+        self._restart_xochitl()
+        # Invalidate cache
+        self._documents = []
+        self._documents_by_id = {}
+        return {"id": doc_id, "parent": new_parent_id, "transport": "ssh"}
 
     def get_all_file_types(self) -> dict[str, Optional[str]]:
         """

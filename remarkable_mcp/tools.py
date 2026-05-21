@@ -1,8 +1,10 @@
 """
 MCP Tools for reMarkable tablet access.
 
-All tools are read-only and idempotent - they only retrieve data from the
-reMarkable Cloud and do not modify any documents.
+Most tools are read-only. Write tools (upload, create_folder, create_notebook,
+move, delete) modify the tablet's library — see their individual annotations
+for destructive/idempotent flags. Write tools require either USB-web mode
+(upload, create_folder, create_notebook) or SSH mode (move, delete).
 """
 
 import base64
@@ -148,6 +150,46 @@ STATUS_ANNOTATIONS = ToolAnnotations(
 IMAGE_ANNOTATIONS = ToolAnnotations(
     title="Get reMarkable Page Image",
     **_BASE_ANNOTATIONS,
+)
+
+UPLOAD_ANNOTATIONS = ToolAnnotations(
+    title="Upload File to reMarkable",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=False,
+)
+
+CREATE_FOLDER_ANNOTATIONS = ToolAnnotations(
+    title="Create reMarkable Folder",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=False,
+)
+
+CREATE_NOTEBOOK_ANNOTATIONS = ToolAnnotations(
+    title="Create reMarkable Notebook",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=False,
+)
+
+MOVE_ANNOTATIONS = ToolAnnotations(
+    title="Move reMarkable Document",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+
+DELETE_ANNOTATIONS = ToolAnnotations(
+    title="Delete reMarkable Document",
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=True,
+    openWorldHint=False,
 )
 
 # Default page size for pagination (characters) - used for PDFs/EPUBs
@@ -1273,6 +1315,18 @@ def remarkable_status() -> str:
 
     try:
         client = get_rmapi()
+
+        # For usb-web, do a live reachability probe so we detect a tablet that
+        # went offline after a previous successful connect (cached doc list
+        # would otherwise mask the disconnect).
+        if REMARKABLE_USE_USB_WEB and hasattr(client, "check_connection"):
+            if not client.check_connection():
+                raise RuntimeError(
+                    f"Cannot reach USB web interface at {connection_info}. "
+                    "Make sure the tablet is connected via USB and "
+                    "'Settings → Storage → USB web interface' is enabled."
+                )
+
         collection = client.get_meta_items()
         items_by_id = get_items_by_id(collection)
 
@@ -1654,4 +1708,331 @@ async def remarkable_image(
             error_type="image_failed",
             message=str(e),
             suggestion="Check remarkable_status() to verify your connection.",
+        )
+
+
+# =============================================================================
+# Write tools (upload, create_folder, create_notebook, move, delete)
+# =============================================================================
+
+
+def _resolve_by_name(client, name: str, want_folder: Optional[bool] = None):
+    """Find a document or folder by name. Returns the matching object or None.
+
+    Args:
+        client: A connected reMarkable client (usb-web, ssh, or cloud).
+        name: VissibleName to match (case-insensitive).
+        want_folder: If True, only match folders. If False, only match
+            documents. If None (default), match either.
+    """
+    if not name:
+        return None
+    target_lower = name.lower().strip("/")
+    items = client.get_meta_items()
+    items_by_id = get_items_by_id(items)
+    for item in items:
+        if want_folder is True and not item.is_folder:
+            continue
+        if want_folder is False and item.is_folder:
+            continue
+        if item.VissibleName.lower() == target_lower:
+            return item
+        # Allow full-path match too
+        if get_item_path(item, items_by_id).lower().strip("/") == target_lower:
+            return item
+    return None
+
+
+def _require_usb_web():
+    """Raise a structured error if the active transport isn't usb-web."""
+    from remarkable_mcp.api import REMARKABLE_USE_SSH, REMARKABLE_USE_USB_WEB
+
+    if not REMARKABLE_USE_USB_WEB:
+        active = "ssh" if REMARKABLE_USE_SSH else "cloud"
+        raise RuntimeError(
+            f"This tool requires the USB web interface, but {active} mode is "
+            "active. Restart the MCP server with --usb (or set "
+            "REMARKABLE_USE_USB_WEB=1) to use upload/create tools."
+        )
+
+
+def _require_ssh():
+    """Raise a structured error if the active transport isn't ssh."""
+    from remarkable_mcp.api import REMARKABLE_USE_SSH, REMARKABLE_USE_USB_WEB
+
+    if not REMARKABLE_USE_SSH:
+        active = "usb-web" if REMARKABLE_USE_USB_WEB else "cloud"
+        raise RuntimeError(
+            f"This tool requires SSH transport, but {active} mode is active. "
+            "The reMarkable USB Web Interface does not expose move or delete "
+            "endpoints — restart the MCP server with --ssh (developer mode "
+            "required) to use move/delete tools. "
+            "See https://remarkable.guide/guide/access/ssh.html"
+        )
+
+
+@mcp.tool(annotations=UPLOAD_ANNOTATIONS)
+def remarkable_upload(file_path: str) -> str:
+    """
+    <usecase>Upload a PDF, EPUB, or .rmdoc file to the reMarkable tablet.</usecase>
+    <instructions>
+    Sends the file to the tablet via the USB web interface. The tablet
+    automatically lands all USB uploads in its "Clippings Import" folder —
+    this is xochitl's behavior and cannot be overridden via /upload. To move
+    the file elsewhere afterward, use remarkable_move (requires SSH mode).
+
+    Requires USB web mode (--usb / REMARKABLE_USE_USB_WEB=1).
+    </instructions>
+    <parameters>
+    - file_path: Absolute path to the file on the host machine.
+    </parameters>
+    <examples>
+    - remarkable_upload("/Users/me/paper.pdf")
+    - remarkable_upload("/tmp/book.epub")
+    </examples>
+    """
+    try:
+        _require_usb_web()
+        path = Path(file_path).expanduser()
+        if not path.is_file():
+            return make_error(
+                error_type="file_not_found",
+                message=f"File not found: {file_path}",
+                suggestion="Provide an absolute path to a readable file.",
+            )
+        client = get_rmapi()
+        result = client.upload(path.read_bytes(), filename=path.name)
+        return make_response(
+            {
+                "uploaded": path.name,
+                "size_bytes": path.stat().st_size,
+                "lands_in": "Clippings Import",
+                "result": result,
+            },
+            f"Uploaded {path.name}. Lands in 'Clippings Import' — use "
+            "remarkable_move (SSH mode) to relocate.",
+        )
+    except Exception as e:
+        return make_error(
+            error_type="upload_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() to verify your connection.",
+        )
+
+
+@mcp.tool(annotations=CREATE_FOLDER_ANNOTATIONS)
+def remarkable_create_folder(name: str, parent_folder: Optional[str] = None) -> str:
+    """
+    <usecase>Create a new folder on the reMarkable tablet.</usecase>
+    <instructions>
+    Writes a CollectionType .metadata file directly to xochitl's storage and
+    restarts xochitl so the folder appears in the UI. The tablet UI will be
+    unresponsive for ~5 seconds during the restart.
+
+    Requires SSH mode (--ssh, developer mode required). The reMarkable USB
+    Web Interface does not expose a folder-creation endpoint.
+    </instructions>
+    <parameters>
+    - name: Folder name as it will appear on the tablet.
+    - parent_folder: Optional name of an existing parent folder.
+    </parameters>
+    <examples>
+    - remarkable_create_folder("Reading")
+    - remarkable_create_folder("Q2", parent_folder="Work")
+    </examples>
+    """
+    try:
+        _require_ssh()
+        if not name or not name.strip():
+            return make_error(
+                error_type="invalid_name",
+                message="Folder name cannot be empty.",
+                suggestion="Pass a non-empty name.",
+            )
+        client = get_rmapi()
+
+        parent_id = ""
+        if parent_folder:
+            folder = _resolve_by_name(client, parent_folder, want_folder=True)
+            if not folder:
+                return make_error(
+                    error_type="folder_not_found",
+                    message=f"Parent folder not found: '{parent_folder}'",
+                    suggestion="Use remarkable_browse('/') to list folders.",
+                )
+            parent_id = folder.ID
+
+        result = client.create_folder(name.strip(), parent_id=parent_id)
+        return make_response(
+            result,
+            f"Created folder '{name}' under {parent_folder or 'root'}. "
+            "Tablet UI restarts briefly to pick up the change.",
+        )
+    except Exception as e:
+        return make_error(
+            error_type="create_folder_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() to verify your SSH connection.",
+        )
+
+
+@mcp.tool(annotations=CREATE_NOTEBOOK_ANNOTATIONS)
+def remarkable_create_notebook(name: str, pages: int = 1) -> str:
+    """
+    <usecase>Create a new blank annotatable document on the reMarkable tablet.</usecase>
+    <instructions>
+    Generates a blank PDF with the requested page count and uploads it via
+    the USB web interface. The result is an annotatable document (write on
+    it with the pen) that behaves like any other PDF.
+
+    The tablet always lands USB uploads in "Clippings Import" — to move the
+    document elsewhere, use remarkable_move (SSH mode) afterward.
+
+    Note: this creates a PDF, not a native .rm notebook. The native .rm v6
+    binary stroke format is reverse-engineered and firmware-fragile; the
+    PDF approach is bullet-proof and indistinguishable for most use cases.
+
+    Requires USB web mode (--usb).
+    </instructions>
+    <parameters>
+    - name: Notebook name as it will appear on the tablet.
+    - pages: Number of blank pages (default: 1, max: 200).
+    </parameters>
+    <examples>
+    - remarkable_create_notebook("Meeting Notes")
+    - remarkable_create_notebook("Sketches", pages=10)
+    </examples>
+    """
+    try:
+        _require_usb_web()
+        if not name or not name.strip():
+            return make_error(
+                error_type="invalid_name",
+                message="Notebook name cannot be empty.",
+                suggestion="Pass a non-empty name.",
+            )
+        if pages < 1 or pages > 200:
+            return make_error(
+                error_type="invalid_pages",
+                message=f"pages must be 1..200, got {pages}.",
+                suggestion="Pass pages between 1 and 200.",
+            )
+        client = get_rmapi()
+        result = client.create_notebook(name.strip(), pages=pages)
+        return make_response(
+            {**result, "lands_in": "Clippings Import"},
+            f"Created notebook '{name}' ({pages} page{'s' if pages != 1 else ''}). "
+            "Lands in 'Clippings Import' — use remarkable_move (SSH) to relocate.",
+        )
+    except Exception as e:
+        return make_error(
+            error_type="create_notebook_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() to verify your connection.",
+        )
+
+
+@mcp.tool(annotations=MOVE_ANNOTATIONS)
+def remarkable_move(document: str, dest_folder: Optional[str] = None) -> str:
+    """
+    <usecase>Move a document or folder to another folder on the reMarkable.</usecase>
+    <instructions>
+    Updates the .metadata file on the tablet and restarts xochitl so the
+    change is picked up. The tablet UI will be unresponsive for ~5 seconds
+    during the restart.
+
+    Requires SSH mode (--ssh, developer mode required). The USB Web
+    Interface does not expose a native move endpoint.
+    </instructions>
+    <parameters>
+    - document: Name of the document or folder to move.
+    - dest_folder: Name of the destination folder. Omit to move to root.
+    </parameters>
+    <examples>
+    - remarkable_move("paper.pdf", dest_folder="Reading")
+    - remarkable_move("Old Notes")  # to root
+    </examples>
+    """
+    try:
+        _require_ssh()
+        client = get_rmapi()
+
+        target = _resolve_by_name(client, document)
+        if not target:
+            return make_error(
+                error_type="document_not_found",
+                message=f"Document not found: '{document}'",
+                suggestion="Use remarkable_browse('/') to list documents.",
+            )
+
+        dest_id = ""
+        if dest_folder:
+            folder = _resolve_by_name(client, dest_folder, want_folder=True)
+            if not folder:
+                return make_error(
+                    error_type="folder_not_found",
+                    message=f"Destination folder not found: '{dest_folder}'",
+                    suggestion="Use remarkable_browse('/') to list folders.",
+                )
+            dest_id = folder.ID
+
+        result = client.move(target.ID, dest_id)
+        return make_response(
+            {**result, "name": target.VissibleName},
+            f"Moved '{target.VissibleName}' to {dest_folder or 'root'}. "
+            "Tablet UI restarts briefly to pick up the change.",
+        )
+    except Exception as e:
+        return make_error(
+            error_type="move_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() to verify your SSH connection.",
+        )
+
+
+@mcp.tool(annotations=DELETE_ANNOTATIONS)
+def remarkable_delete(document: str) -> str:
+    """
+    <usecase>Delete (move to trash) a document or folder on the reMarkable.</usecase>
+    <instructions>
+    Sets deleted=true in the document's .metadata and restarts xochitl. The
+    item moves to the tablet's Trash and stays recoverable until the user
+    empties trash from the tablet UI.
+
+    Requires SSH mode (--ssh, developer mode required). The USB Web
+    Interface does not expose a native delete endpoint.
+
+    DESTRUCTIVE: removes the document from the user's library view. Confirm
+    intent before invoking.
+    </instructions>
+    <parameters>
+    - document: Name of the document or folder to delete.
+    </parameters>
+    <examples>
+    - remarkable_delete("Draft notes")
+    </examples>
+    """
+    try:
+        _require_ssh()
+        client = get_rmapi()
+
+        target = _resolve_by_name(client, document)
+        if not target:
+            return make_error(
+                error_type="document_not_found",
+                message=f"Document not found: '{document}'",
+                suggestion="Use remarkable_browse('/') to list documents.",
+            )
+
+        result = client.delete(target.ID)
+        return make_response(
+            {**result, "name": target.VissibleName},
+            f"Moved '{target.VissibleName}' to Trash. Recoverable from the "
+            "tablet's Trash until emptied.",
+        )
+    except Exception as e:
+        return make_error(
+            error_type="delete_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() to verify your SSH connection.",
         )
