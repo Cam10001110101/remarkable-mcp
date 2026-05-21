@@ -1641,6 +1641,37 @@ class TestOcrDispatcher:
             assert await ocr.ocr_png(b"x", ctx=None) == ("O", "ollama")
 
 
+class TestExtractHandwritingDelegation:
+    """extract_handwriting_ocr renders pages then delegates to ocr.ocr_png_sync."""
+
+    def test_extract_handwriting_delegates_to_ocr(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp.extract import extract_handwriting_ocr
+
+        rm_files = ["/tmp/p1.rm", "/tmp/p2.rm"]
+        with patch(
+            "remarkable_mcp.extract.render_rm_file_to_png", return_value=b"PNG"
+        ), patch(
+            "remarkable_mcp.ocr.ocr_png_sync",
+            side_effect=[("page one", "ollama"), ("page two", "ollama")],
+        ):
+            results, backend = extract_handwriting_ocr(rm_files)
+        assert results == ["page one", "page two"]
+        assert backend == "ollama"
+
+    def test_extract_handwriting_skips_unrenderable_pages(self):
+        from unittest.mock import patch
+
+        from remarkable_mcp.extract import extract_handwriting_ocr
+
+        with patch(
+            "remarkable_mcp.extract.render_rm_file_to_png", return_value=None
+        ), patch("remarkable_mcp.ocr.ocr_png_sync", return_value=("x", "tesseract")):
+            results, backend = extract_handwriting_ocr(["/tmp/p1.rm"])
+        assert results is None and backend is None
+
+
 # =============================================================================
 # Test Tag Support
 # =============================================================================
