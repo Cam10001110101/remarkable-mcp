@@ -1491,6 +1491,13 @@ class TestOcrConfig:
             assert ocr.ollama_available() is False
         ocr._reset_ollama_cache()
 
+    def test_normalize_host(self):
+        from remarkable_mcp import ocr
+
+        assert ocr._normalize_host("127.0.0.1:11434") == "http://127.0.0.1:11434"
+        assert ocr._normalize_host("http://h:1/") == "http://h:1"
+        assert ocr._normalize_host("https://x") == "https://x"
+
 
 class TestOllamaEngine:
     """The local Ollama OCR engine."""
@@ -1573,6 +1580,37 @@ class TestPngEngines:
         with patch("builtins.__import__", side_effect=fake_import):
             assert ocr.ocr_png_tesseract(b"x") is None
 
+    def test_ocr_png_google_no_key_delegates_to_sdk(self):
+        import os
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        os.environ.pop("GOOGLE_VISION_API_KEY", None)
+        with patch("remarkable_mcp.ocr._ocr_png_google_sdk", return_value="SDK text"):
+            assert ocr.ocr_png_google(b"x") == "SDK text"
+
+    def test_ocr_png_google_sdk_returns_none_without_library(self):
+        from remarkable_mcp import ocr
+
+        # google-cloud-vision is an optional dep; absent (or uncredentialed) -> None.
+        assert ocr._ocr_png_google_sdk(b"x") is None
+
+    def test_ocr_png_google_empty_response_returns_none(self):
+        import os
+        from unittest.mock import MagicMock, patch
+
+        from remarkable_mcp import ocr
+
+        os.environ["GOOGLE_VISION_API_KEY"] = "k"
+        try:
+            resp = MagicMock(status_code=200)
+            resp.json.return_value = {"responses": [{}]}
+            with patch("remarkable_mcp.ocr.requests.post", return_value=resp):
+                assert ocr.ocr_png_google(b"x") is None
+        finally:
+            os.environ.pop("GOOGLE_VISION_API_KEY", None)
+
 
 class TestOcrDispatcher:
     """Backend resolution + sync/async dispatch."""
@@ -1639,6 +1677,39 @@ class TestOcrDispatcher:
             "remarkable_mcp.ocr.ocr_png_ollama", return_value="O"
         ):
             assert await ocr.ocr_png(b"x", ctx=None) == ("O", "ollama")
+
+    def test_sync_dispatch_explicit_ollama_chain(self):
+        import os
+        from unittest.mock import patch
+
+        from remarkable_mcp import ocr
+
+        os.environ["REMARKABLE_OCR_BACKEND"] = "ollama"
+        try:
+            with patch("remarkable_mcp.ocr.ocr_png_ollama", return_value=None), patch(
+                "remarkable_mcp.ocr.ocr_png_google", return_value=None
+            ), patch("remarkable_mcp.ocr.ocr_png_tesseract", return_value="T"):
+                assert ocr.ocr_png_sync(b"x") == ("T", "tesseract")
+        finally:
+            os.environ.pop("REMARKABLE_OCR_BACKEND", None)
+
+    @pytest.mark.asyncio
+    async def test_async_dispatch_sampling_first(self):
+        import os
+        from unittest.mock import AsyncMock, patch
+
+        from remarkable_mcp import ocr
+
+        os.environ["REMARKABLE_OCR_BACKEND"] = "sampling"
+        try:
+            with patch(
+                "remarkable_mcp.ocr.client_supports_sampling", return_value=True
+            ), patch(
+                "remarkable_mcp.ocr.ocr_png_sampling", new=AsyncMock(return_value="S")
+            ):
+                assert await ocr.ocr_png(b"x", ctx=object()) == ("S", "sampling")
+        finally:
+            os.environ.pop("REMARKABLE_OCR_BACKEND", None)
 
 
 class TestExtractHandwritingDelegation:

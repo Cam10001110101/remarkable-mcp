@@ -128,6 +128,9 @@ def ocr_png_tesseract(png: bytes) -> Optional[str]:
         from PIL import Image, ImageFilter, ImageOps
 
         img = Image.open(io.BytesIO(png)).convert("L")
+        # Upscale 1.5x before OCR -- Tesseract is resolution-sensitive on sparse
+        # handwriting (parity with the prior 1.5x page render).
+        img = img.resize((int(img.width * 1.5), int(img.height * 1.5)))
         img = ImageOps.autocontrast(img, cutoff=2)
         img = img.filter(ImageFilter.SHARPEN)
         text = pytesseract.image_to_string(img, config=r"--psm 11 --oem 3")
@@ -139,10 +142,15 @@ def ocr_png_tesseract(png: bytes) -> Optional[str]:
 
 
 def ocr_png_google(png: bytes) -> Optional[str]:
-    """Google Cloud Vision REST OCR on PNG bytes. Requires GOOGLE_VISION_API_KEY."""
+    """Google Cloud Vision OCR on PNG bytes.
+
+    Uses the GOOGLE_VISION_API_KEY REST endpoint when set; otherwise falls back to
+    the google-cloud-vision SDK with service-account credentials
+    (GOOGLE_APPLICATION_CREDENTIALS). Returns None if neither path yields text.
+    """
     api_key = os.environ.get("GOOGLE_VISION_API_KEY")
     if not api_key:
-        return None
+        return _ocr_png_google_sdk(png)
     try:
         image_b64 = base64.b64encode(png).decode("utf-8")
         resp = requests.post(
@@ -164,6 +172,25 @@ def ocr_png_google(png: bytes) -> Optional[str]:
             text = responses[0]["fullTextAnnotation"]["text"].strip()
             return text or None
         return None
+    except Exception:
+        return None
+
+
+def _ocr_png_google_sdk(png: bytes) -> Optional[str]:
+    """Google Vision via the google-cloud-vision SDK (service-account creds).
+
+    Used when GOOGLE_VISION_API_KEY is absent. Returns None if the SDK is not
+    installed or credentials are unavailable.
+    """
+    try:
+        from google.cloud import vision
+
+        client = vision.ImageAnnotatorClient()
+        response = client.document_text_detection(image=vision.Image(content=png))
+        if response.error.message:
+            return None
+        text = (response.full_text_annotation.text or "").strip()
+        return text or None
     except Exception:
         return None
 
